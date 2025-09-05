@@ -1,7 +1,28 @@
+# Ambientes virtuais
 venv/
+ENV/
+env/
 .venv/
+
+# Cache do Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+
+# Arquivos de log
+*.log
+
+# Arquivos temporários
+*.tmp
+*.swp
+*.bak
+
+# Configurações locais
 *.env
+*.ini
+
+# Banco de dados locais
+*.sqlite3
+
+# Jupyter Notebooks checkpoints
+.ipynb_checkpoints/

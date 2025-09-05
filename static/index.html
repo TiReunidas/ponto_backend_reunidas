@@ -1,23 +1,109 @@
 <!DOCTYPE html>
-<html lang="pt-br">
+<html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Painel RH - Registro de Ponto</title>
+    <title>Painel de Administração RH - Ponto Reuni-IA</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
     <div class="container">
         <h1>Painel de Administração RH</h1>
+        
+        <div class="card">
+            <h2>Cadastrar Novo Funcionário</h2>
+            <form id="employee-form">
+                <div class="form-group">
+                    <label for="employee-name">Nome Completo:</label>
+                    <input type="text" id="employee-name" required>
+                </div>
+                <div class="form-group">
+                    <label for="employee-id">Matrícula (10 dígitos):</label>
+                    <input type="text" id="employee-id" maxlength="10" pattern="\d{10}" title="A matrícula deve conter exatamente 10 números." required>
+                </div>
+                <div class="form-group">
+                    <label for="employee-photo">Foto de Rosto (Referência):</label>
+                    <input type="file" id="employee-photo" accept="image/jpeg" required>
+                </div>
+                <button type="submit">Cadastrar Funcionário</button>
+            </form>
+            <div id="status-message"></div>
+        </div>
 
         <div class="card">
             <h2>Funcionários Cadastrados</h2>
             <ul id="employee-list">
-                <li>Carregando funcionários...</li>
+                <li>A carregar...</li>
             </ul>
         </div>
-    </div>
 
+        <div id="employee-details-section" class="card" style="display: none;">
+            <h2 id="details-employee-name"></h2>
+
+            <h3>Histórico de Pontos</h3>
+            <table id="punch-table">
+                <thead>
+                    <tr>
+                        <th>Data e Hora</th>
+                        <th>Tipo</th>
+                        <th>Verificação</th>
+                        <th>Evidência</th>
+                        <th>Ações</th>
+                    </tr>
+                </thead>
+                <tbody id="punch-table-body"></tbody>
+            </table>
+
+            <div class="manual-punch-section">
+                <h3>Adicionar Batida Manual</h3>
+                <form id="form-manual-punch">
+                    <div class="form-group">
+                        <label for="manual-datetime">Data e Hora:</label>
+                        <input type="datetime-local" id="manual-datetime" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="manual-type">Tipo:</label>
+                        <select id="manual-type">
+                            <option value="Entrada">Entrada</option>
+                            <option value="Saída">Saída</option>
+                        </select>
+                    </div>
+                    <button type="submit">Adicionar Ponto</button>
+                </form>
+            </div>
+            
+            <!-- SECÇÃO DE CÁLCULO ATUALIZADA COM O NOVO FLUXO -->
+            <div class="calculation-section">
+                <h3>Calcular Horas Extras Mensal</h3>
+                <form id="calculation-form">
+                    <div class="form-group">
+                        <label for="calculation-month">Selecione o Mês e Ano:</label>
+                        <input type="month" id="calculation-month" required>
+                    </div>
+                    <!-- Botão inicial para buscar os dados -->
+                    <button type="button" id="fetch-hours-btn">1. Buscar Dados do Sistema Principal</button>
+                    
+                    <!-- Área que aparece DEPOIS que os dados são buscados -->
+                    <div id="confirmation-area" style="display: none;">
+                        <hr>
+                        <h4>Dados do Sistema Principal (Valores Editáveis):</h4>
+                        <div class="form-group">
+                            <label for="main-system-hours-50">Total de Horas a 50% (PROTHEUS):</label>
+                            <input type="number" step="0.01" id="main-system-hours-50" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="main-system-hours-100">Total de Horas a 100% (PROTHEUS):</label>
+                            <input type="number" step="0.01" id="main-system-hours-100" required>
+                        </div>
+                        <!-- Botão final para o cálculo consolidado -->
+                        <button type="submit">2. Confirmar e Calcular Total</button>
+                    </div>
+                </form>
+                <div id="calculation-result"></div>
+            </div>
+        </div>
+    </div>
     <script src="/static/script.js"></script>
 </body>
 </html>
+
