@@ -15,3 +15,5 @@ class Employee(Base):
     id = Column(Integer, primary_key=True, index=True)
     employee_id = Column(String, unique=True, index=True)
     name = Column(String)
+    
+

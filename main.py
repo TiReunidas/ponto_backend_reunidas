@@ -24,6 +24,11 @@ import holidays
 from fastapi import Body
 from pydantic import BaseModel, Field
 from typing import List, Optional
+import security
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm # MODIFIQUE ESTA LINHA
+from datetime import timedelta
+
+
 
 br_holidays = holidays.Brazil()
 
@@ -126,17 +131,17 @@ async def read_index():
     return FileResponse(os.path.join(BASE_DIR, "static", "index.html"))
 
 @app.get("/employees")
-def get_employees(db: Session = Depends(get_db_app)):
+def get_employees(db: Session = Depends(get_db_app),admin_user: dict = Depends(security.get_current_user)):
     employees = db.query(models.Employee).order_by(models.Employee.name).all()
     return {"employees": [{"employee_id": emp.employee_id, "name": emp.name} for emp in employees]}
 
 @app.get("/punches/{employee_id}")
-def get_punches_for_employee(employee_id: str, db: Session = Depends(get_db_app)):
+def get_punches_for_employee(employee_id: str, db: Session = Depends(get_db_app),admin_user: dict = Depends(security.get_current_user)):
     punches = db.query(models.Punch).filter(models.Punch.employee_id == employee_id).order_by(models.Punch.timestamp.desc()).all()
     return {"punches": [{"id": p.id, "timestamp": p.timestamp, "type": p.type, "photo_path": os.path.basename(p.photo_path) if p.photo_path else None, "verified": p.verified} for p in punches]}
 
 @app.post("/employees")
-async def register_employee(employee_id: str = Form(...), employee_name: str = Form(...), photo: UploadFile = File(...), db: Session = Depends(get_db_app)):
+async def register_employee(employee_id: str = Form(...), employee_name: str = Form(...), photo: UploadFile = File(...), db: Session = Depends(get_db_app),admin_user: dict = Depends(security.get_current_user)):
     existing_employee = db.query(models.Employee).filter(models.Employee.employee_id == employee_id).first()
     if existing_employee:
         raise HTTPException(status_code=400, detail="Matrícula já cadastrada.")
@@ -157,7 +162,7 @@ async def register_employee(employee_id: str = Form(...), employee_name: str = F
 
 # --- ENDPOINT /punch COM A LÓGICA CORRETA E ESTÁVEL ---
 @app.post("/punch")
-async def create_punch(employee_id: str = Form(...), timestamp: int = Form(...), photo: UploadFile = File(...), db: Session = Depends(get_db_app)):
+async def create_punch(employee_id: str = Form(...), timestamp: int = Form(...), photo: UploadFile = File(...), db: Session = Depends(get_db_app),admin_user: dict = Depends(security.get_current_user)):
     logger.info(f"--- INICIANDO PROCESSO PARA MATRÍCULA: {employee_id} ---")
     encoding_path = os.path.join(ENCODINGS_DIR, f"{employee_id}.npy")
     if not os.path.exists(encoding_path):
@@ -202,7 +207,7 @@ async def create_punch(employee_id: str = Form(...), timestamp: int = Form(...),
 
 # --- ENDPOINTS DE GESTÃO E CÁLCULO ---
 @app.put("/punches/{punch_id}")
-def update_punch(punch_id: int, request: PunchUpdateRequest, db: Session = Depends(get_db_app)):
+def update_punch(punch_id: int, request: PunchUpdateRequest, db: Session = Depends(get_db_app),admin_user: dict = Depends(security.get_current_user)):
     punch_to_update = db.query(models.Punch).filter(models.Punch.id == punch_id).first()
     if not punch_to_update:
         raise HTTPException(status_code=404, detail="Registro de ponto não encontrado.")
@@ -212,7 +217,7 @@ def update_punch(punch_id: int, request: PunchUpdateRequest, db: Session = Depen
     return {"status": "success", "message": "Registro atualizado com sucesso."}
 
 @app.delete("/punches/{punch_id}")
-def delete_punch(punch_id: int, db: Session = Depends(get_db_app)):
+def delete_punch(punch_id: int, db: Session = Depends(get_db_app),admin_user: dict = Depends(security.get_current_user)):
     punch_to_delete = db.query(models.Punch).filter(models.Punch.id == punch_id).first()
     if not punch_to_delete:
         raise HTTPException(status_code=404, detail="Registro de ponto não encontrado.")
@@ -227,7 +232,7 @@ def delete_punch(punch_id: int, db: Session = Depends(get_db_app)):
     return {"status": "success", "message": "Registro apagado com sucesso."}
 
 @app.post("/punches/manual")
-def create_manual_punch(request: PunchCreateRequest, db: Session = Depends(get_db_app)):
+def create_manual_punch(request: PunchCreateRequest, db: Session = Depends(get_db_app),admin_user: dict = Depends(security.get_current_user)):
     new_punch = models.Punch(employee_id=request.employee_id, timestamp=request.timestamp, type=request.type, photo_path=None, verified=True)
     db.add(new_punch)
     db.commit()
@@ -382,7 +387,7 @@ def get_main_system_hours(
 
 
 @app.post("/report")
-def generate_report(request: ReportRequest, db_app: Session = Depends(get_db_app), db_main: Session = Depends(get_db_main)):
+def generate_report(request: ReportRequest, db_app: Session = Depends(get_db_app), db_main: Session = Depends(get_db_main),admin_user: dict = Depends(security.get_current_user)):
     """
     Gera um relatório consolidado de horas extras para múltiplos funcionários
     dentro de um período de tempo.
@@ -424,3 +429,23 @@ def generate_report(request: ReportRequest, db_app: Session = Depends(get_db_app
 
     return {"status": "success", "data": report_data}
 
+
+@app.post("/token")
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    # Verifica se o usuário corresponde ao admin
+    is_correct_username = form_data.username == security.ADMIN_USERNAME
+    # Verifica se a senha corresponde à senha do admin
+    is_correct_password = security.verify_password(form_data.password, security.ADMIN_HASHED_PASSWORD)
+
+    if not (is_correct_username and is_correct_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Usuário ou senha incorreta",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token_expires = timedelta(minutes=security.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = security.create_access_token(
+        data={"sub": security.ADMIN_USERNAME}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
