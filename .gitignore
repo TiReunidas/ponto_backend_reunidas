@@ -17,7 +17,7 @@ __pycache__/
 *.swp
 *.bak
 
-# Configurações locais
+# Configurações locais / variáveis de ambiente
 *.env
 *.ini
 
@@ -26,3 +26,12 @@ __pycache__/
 
 # Jupyter Notebooks checkpoints
 .ipynb_checkpoints/
+
+# IDEs e editores
+.vscode/
+.idea/
+
+# Arquivos de build/distribuição
+dist/
+build/
+*.egg-info/

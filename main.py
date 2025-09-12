@@ -1,451 +1,407 @@
-import os
-import shutil
 import logging
-import uuid
-import calendar
-import numpy as np
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Query
+import os
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.staticfiles import StaticFiles
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
-from sqlalchemy import text
-from deepface import DeepFace
-import cv2
+from datetime import date, datetime, time, timedelta
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel
+import holidays
+import calendar
+import pandas as pd
+from fastapi import File, UploadFile
+
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from fastapi.middleware.cors import CORSMiddleware
+
 import models
 from database import SessionLocal_App, engine_app, SessionLocal_Main
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from typing import List, Dict
-from pydantic import BaseModel
-from datetime import date, datetime, time
-from collections import defaultdict
-# Importamos a função de cálculo de distância diretamente
-from deepface.modules.verification import find_cosine_distance
 import main_system_queries
-import holidays
-from fastapi import Body
-from pydantic import BaseModel, Field
-from typing import List, Optional
-import security
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm # MODIFIQUE ESTA LINHA
-from datetime import timedelta
 
-
-
-br_holidays = holidays.Brazil()
-
-# Cria as tabelas no banco de dados (se não existirem) ao iniciar
-models.Base.metadata.create_all(bind=engine_app)
-
-# --- Configuração ---
+# --- CONFIGURAÇÕES GERAIS ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+br_holidays = holidays.Brazil(state='GO')
+br_holidays.update({"2025-01-21": "Aniversário de Goiatuba"})
+
+models.Base.metadata.create_all(bind=engine_app)
 app = FastAPI()
 
-# --- Definição de Pastas ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-REFERENCE_DIR = os.path.join(BASE_DIR, "fotos_referencia")
-PUNCH_DIR = os.path.join(BASE_DIR, "fotos_batidas")
-ENCODINGS_DIR = os.path.join(BASE_DIR, "encodings")
-os.makedirs(REFERENCE_DIR, exist_ok=True)
-os.makedirs(PUNCH_DIR, exist_ok=True)
-os.makedirs(ENCODINGS_DIR, exist_ok=True)
+origins = ["*"]
+app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# <<< Nosso Limite de Sensibilidade Personalizado >>>
-MODEL_THRESHOLD = 0.50
-
-# --- Servir Arquivos Estáticos ---
-app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
-app.mount("/punch-photos", StaticFiles(directory=PUNCH_DIR), name="punch_photos")
-
-# --- Conexão com os Bancos de Dados ---
+# --- DEPENDÊNCIAS DE BANCO E SEGURANÇA ---
 def get_db_app():
     db = SessionLocal_App()
-    try:
-        yield db
-    finally:
-        db.close()
+    try: yield db
+    finally: db.close()
 
 def get_db_main():
     db = SessionLocal_Main()
+    try: yield db
+    finally: db.close()
+        
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+
+SECRET_KEY = "SUA_CHAVE_SECRETA_MUITO_FORTE_E_LONGA"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+def verify_password(plain_password, hashed_password): return pwd_context.verify(plain_password, hashed_password)
+def get_password_hash(password): return pwd_context.hash(password)
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db_app)):
+    credentials_exception = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials", headers={"WWW-Authenticate": "Bearer"})
     try:
-        yield db
-    finally:
-        db.close()
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None: raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = db.query(models.AppUser).filter(models.AppUser.username == username).first()
+    if user is None: raise credentials_exception
+    return user
+
+# --- LÓGICA DE CÁLCULO DE CICLO ---
+def get_cycle_week(work_date: date, start_date: date, weeks_in_cycle: int) -> int:
+    if not start_date or not weeks_in_cycle or weeks_in_cycle == 0: return 1
+    days_passed = (work_date - start_date).days
+    if days_passed < 0: return 1
+    current_week = (days_passed // 7) % weeks_in_cycle + 1
+    return current_week
 
 # --- Pydantic Models ---
-class CalculationRequest(BaseModel):
+class UserCreate(BaseModel): username: str; password: str
+class Token(BaseModel): access_token: str; token_type: str
+class ExternalPunchRequest(BaseModel): employee_id: str; work_date: date; entry1: Optional[time] = None; exit1: Optional[time] = None; entry2: Optional[time] = None; exit2: Optional[time] = None
+class CalculatedMinutes(BaseModel):
+    normal: int
+    overtime_50: int
+    overtime_100: int
+    undertime: int
+class DailyBreakdown(BaseModel):
+    date: date
+    main_system_punches: Dict[str, Optional[time]]
+    app_punches: Dict[str, Optional[time]]
+    calculated_minutes: CalculatedMinutes
+    status: Optional[str] = None
+class DetailedReportData(BaseModel):
     employee_id: str
+    employee_name: str
+    shift_description: str
+    daily_breakdown: List[DailyBreakdown]
+    totals_in_minutes: CalculatedMinutes
+class MonthlyReportRequest(BaseModel):
+    employee_ids: List[str]
     year: int
     month: int
-    main_system_hours_50: float = 0.0
-    main_system_hours_100: float = 0.0
-
-class PunchUpdateRequest(BaseModel):
-    timestamp: int
-    type: str
-
-class PunchCreateRequest(BaseModel):
+    cycle_start_date: date
+class ManualOverrideRequest(BaseModel):
     employee_id: str
-    timestamp: int
-    type: str
-
-class ReportRequest(BaseModel):
-    employee_ids: List[str] # Uma lista de IDs. Se vazia, consideraremos "todos".
     start_date: date
     end_date: date
+    override_type: str
+    description: Optional[str] = None
 
+# --- LÓGICA DE NEGÓCIO ---
 
-# --- Funções Auxiliares ---
-def create_face_encoding(image_path: str):
-    try:
-        embedding_objs = DeepFace.represent(img_path=image_path, model_name="VGG-Face", enforce_detection=True, detector_backend='opencv')
-        if not embedding_objs: return None
-        return embedding_objs[0]['embedding']
-    except Exception as e:
-        logger.error(f"Erro ao criar encoding para a imagem {os.path.basename(image_path)}: {e}")
-        return None
-
-def perform_calculation(app_punches: List[models.Punch], main_system_hours: float):
-    if not app_punches or len(app_punches) < 2:
-        return {"hours_at_50": 0, "hours_at_100": 0, "total_app_hours": 0}
-    total_app_milliseconds = 0
-    paired_punches = sorted(app_punches, key=lambda p: p.timestamp)
-    for i in range(0, len(paired_punches) - 1, 2):
-        entrada = paired_punches[i]
-        saida = paired_punches[i+1]
-        if entrada.type == "Entrada" and saida.type == "Saída":
-            total_app_milliseconds += (saida.timestamp - entrada.timestamp)
-    total_app_hours = total_app_milliseconds / (1000 * 60 * 60)
-    total_overtime_hours = total_app_hours + main_system_hours
-    threshold = 2.0
-    total_hours_at_50 = min(total_overtime_hours, threshold)
-    total_hours_at_100 = max(0, total_overtime_hours - threshold)
-    app_hours_at_50 = max(0, total_hours_at_50 - main_system_hours)
-    app_hours_at_100 = total_app_hours - app_hours_at_50
-    return {"hours_at_50": round(app_hours_at_50, 2), "hours_at_100": round(app_hours_at_100, 2), "total_app_hours": round(total_app_hours, 2)}
-
-# =================================================================
-# ENDPOINTS DA API
-# =================================================================
-@app.get("/")
-async def read_index():
-    return FileResponse(os.path.join(BASE_DIR, "static", "index.html"))
-
-@app.get("/employees")
-def get_employees(db: Session = Depends(get_db_app),admin_user: dict = Depends(security.get_current_user)):
-    employees = db.query(models.Employee).order_by(models.Employee.name).all()
-    return {"employees": [{"employee_id": emp.employee_id, "name": emp.name} for emp in employees]}
-
-@app.get("/punches/{employee_id}")
-def get_punches_for_employee(employee_id: str, db: Session = Depends(get_db_app),admin_user: dict = Depends(security.get_current_user)):
-    punches = db.query(models.Punch).filter(models.Punch.employee_id == employee_id).order_by(models.Punch.timestamp.desc()).all()
-    return {"punches": [{"id": p.id, "timestamp": p.timestamp, "type": p.type, "photo_path": os.path.basename(p.photo_path) if p.photo_path else None, "verified": p.verified} for p in punches]}
-
-@app.post("/employees")
-async def register_employee(employee_id: str = Form(...), employee_name: str = Form(...), photo: UploadFile = File(...), db: Session = Depends(get_db_app),admin_user: dict = Depends(security.get_current_user)):
-    existing_employee = db.query(models.Employee).filter(models.Employee.employee_id == employee_id).first()
-    if existing_employee:
-        raise HTTPException(status_code=400, detail="Matrícula já cadastrada.")
-    reference_photo_path = os.path.join(REFERENCE_DIR, f"{employee_id}.jpg")
-    with open(reference_photo_path, "wb") as buffer:
-        shutil.copyfileobj(photo.file, buffer)
-    encoding = create_face_encoding(reference_photo_path)
-    if encoding is None:
-        os.remove(reference_photo_path)
-        raise HTTPException(status_code=400, detail="Nenhum rosto detectado na foto de referência.")
-    encoding_path = os.path.join(ENCODINGS_DIR, f"{employee_id}.npy")
-    np.save(encoding_path, np.array(encoding))
-    new_employee = models.Employee(employee_id=employee_id, name=employee_name)
-    db.add(new_employee)
-    db.commit()
-    db.refresh(new_employee)
-    return {"status": "success", "message": f"Funcionário {employee_name} cadastrado com sucesso!"}
-
-# --- ENDPOINT /punch COM A LÓGICA CORRETA E ESTÁVEL ---
-@app.post("/punch")
-async def create_punch(employee_id: str = Form(...), timestamp: int = Form(...), photo: UploadFile = File(...), db: Session = Depends(get_db_app),admin_user: dict = Depends(security.get_current_user)):
-    logger.info(f"--- INICIANDO PROCESSO PARA MATRÍCULA: {employee_id} ---")
-    encoding_path = os.path.join(ENCODINGS_DIR, f"{employee_id}.npy")
-    if not os.path.exists(encoding_path):
-        raise HTTPException(status_code=404, detail="Funcionário não possui verificação facial cadastrada.")
-    reference_encoding = np.load(encoding_path)
-    punch_photo_path = os.path.join(PUNCH_DIR, f"{employee_id}-{uuid.uuid4()}.jpg")
-    with open(punch_photo_path, "wb") as buffer:
-        shutil.copyfileobj(photo.file, buffer)
-    logger.info(f"Foto da batida salva em: {punch_photo_path}")
-    is_match = False
-    try:
-        logger.info("Gerando encoding da foto da batida...")
-        punch_encoding = create_face_encoding(punch_photo_path)
-        if punch_encoding is not None:
-            logger.info("Comparando as duas digitais faciais...")
-            distance = find_cosine_distance(reference_encoding, punch_encoding)
-            is_match = distance <= MODEL_THRESHOLD
-            logger.info(f"Distância: {distance}, Limite: {MODEL_THRESHOLD}")
-        else:
-            logger.warning("Não foi possível gerar a digital da foto da batida (nenhum rosto encontrado).")
-            is_match = False
-    except Exception as e:
-        logger.error(f"Ocorreu um erro inesperado durante a comparação: {e}")
-        is_match = False
-    logger.info(f"Resultado final da verificação para {employee_id}: {'Match' if is_match else 'No Match'}")
-    last_punch = db.query(models.Punch).filter(models.Punch.employee_id == employee_id).order_by(models.Punch.timestamp.desc()).first()
-    punch_type = "Entrada"
-    if last_punch and last_punch.type == "Entrada":
-        punch_type = "Saída"
-    new_punch = models.Punch(employee_id=employee_id, timestamp=timestamp, type=punch_type, photo_path=punch_photo_path, verified=is_match)
-    db.add(new_punch)
-    db.commit()
-    db.refresh(new_punch)
-    logger.info(f"Ponto de '{punch_type}' para {employee_id} salvo no banco com ID: {new_punch.id}")
-    if is_match:
-        try:
-            os.remove(punch_photo_path)
-            logger.info(f"Foto da batida {punch_photo_path} apagada (verificação OK).")
-        except Exception as e:
-            logger.error(f"Erro ao tentar apagar a foto da batida: {e}")
-    return {"status": "success", "message": "Ponto processado.", "verified": bool(is_match)}
-
-# --- ENDPOINTS DE GESTÃO E CÁLCULO ---
-@app.put("/punches/{punch_id}")
-def update_punch(punch_id: int, request: PunchUpdateRequest, db: Session = Depends(get_db_app),admin_user: dict = Depends(security.get_current_user)):
-    punch_to_update = db.query(models.Punch).filter(models.Punch.id == punch_id).first()
-    if not punch_to_update:
-        raise HTTPException(status_code=404, detail="Registro de ponto não encontrado.")
-    punch_to_update.timestamp = request.timestamp
-    punch_to_update.type = request.type
-    db.commit()
-    return {"status": "success", "message": "Registro atualizado com sucesso."}
-
-@app.delete("/punches/{punch_id}")
-def delete_punch(punch_id: int, db: Session = Depends(get_db_app),admin_user: dict = Depends(security.get_current_user)):
-    punch_to_delete = db.query(models.Punch).filter(models.Punch.id == punch_id).first()
-    if not punch_to_delete:
-        raise HTTPException(status_code=404, detail="Registro de ponto não encontrado.")
-    if punch_to_delete.photo_path and os.path.exists(punch_to_delete.photo_path):
-        try:
-            os.remove(punch_to_delete.photo_path)
-            logger.info(f"Arquivo de foto associado ({punch_to_delete.photo_path}) apagado.")
-        except Exception as e:
-            logger.error(f"Erro ao tentar apagar o arquivo de foto {punch_to_delete.photo_path}: {e}")
-    db.delete(punch_to_delete)
-    db.commit()
-    return {"status": "success", "message": "Registro apagado com sucesso."}
-
-@app.post("/punches/manual")
-def create_manual_punch(request: PunchCreateRequest, db: Session = Depends(get_db_app),admin_user: dict = Depends(security.get_current_user)):
-    new_punch = models.Punch(employee_id=request.employee_id, timestamp=request.timestamp, type=request.type, photo_path=None, verified=True)
-    db.add(new_punch)
-    db.commit()
-    db.refresh(new_punch)
-    return {"status": "success", "message": "Registro manual adicionado com sucesso."}
-
-@app.post("/calculate")
-def calculate_overtime(request: CalculationRequest, db_app: Session = Depends(get_db_app)):
-    logger.info(f"Iniciando cálculo final para Matrícula: {request.employee_id} para {request.month}/{request.year}")
-
-    # =========================================================================
-    # PASSO 1: Pegar os totais do Sistema Principal (já calculados e confirmados pelo usuário na tela)
-    # =========================================================================
-    main_system_total_50 = request.main_system_hours_50
-    main_system_total_100 = request.main_system_hours_100
-
-    # =========================================================================
-    # PASSO 2: Buscar as batidas de ponto registradas SOMENTE neste novo sistema
-    # =========================================================================
-    _, num_days_in_month = calendar.monthrange(request.year, request.month)
-    start_date = date(request.year, request.month, 1)
-    end_date = date(request.year, request.month, num_days_in_month)
-    start_ts = int(datetime.combine(start_date, time.min).timestamp() * 1000)
-    end_ts = int(datetime.combine(end_date, time.max).timestamp() * 1000)
-    
-    punches = db_app.query(models.Punch).filter(
-        models.Punch.employee_id == request.employee_id,
-        models.Punch.timestamp.between(start_ts, end_ts),
-        models.Punch.verified == True
-    ).order_by(models.Punch.timestamp.asc()).all()
-    
-    punches_by_day: Dict[date, List] = defaultdict(list)
-    for punch in punches:
-        punch_date = datetime.fromtimestamp(punch.timestamp / 1000).date()
-        punches_by_day[punch_date].append(punch)
-
-    # =========================================================================
-    # PASSO 3: Calcular as horas extras GERADAS PELO NOVO SISTEMA
-    # =========================================================================
-    app_total_50 = 0.0
-    app_total_100 = 0.0
-
-    for day, day_punches in punches_by_day.items():
-        is_special_day = (day.weekday() == 6 or day in br_holidays)
-
-        # --- LÓGICA PARA DOMINGOS E FERIADOS (AGORA MAIS FLEXÍVEL) ---
-        if is_special_day:
-            punches_count = len(day_punches)
-            total_minutes_worked = 0
-
-            # Ignora dias com número ímpar ou insuficiente de batidas
-            if punches_count < 2 or punches_count % 2 != 0:
-                logger.warning(f"Dia especial ({day}) com número inválido de batidas ({punches_count}). As batidas deste dia foram ignoradas.")
-                continue
-
-            timestamps_ms = sorted([p.timestamp for p in day_punches])
-
-            # CENÁRIO 1: Trabalho com almoço (4 batidas)
-            if punches_count == 4:
-                duration_ms = (timestamps_ms[1] - timestamps_ms[0]) + (timestamps_ms[3] - timestamps_ms[2])
-                total_minutes_worked = duration_ms / 60000.0  # milissegundos para minutos
-            
-            # CENÁRIO 2: Trabalho direto sem almoço (2 batidas)
-            elif punches_count == 2:
-                duration_ms = timestamps_ms[1] - timestamps_ms[0]
-                total_minutes_worked = duration_ms / 60000.0  # milissegundos para minutos
-            
-            # Todas as horas trabalhadas em dias especiais são 100%
-            if total_minutes_worked > 0:
-                app_total_100 += (total_minutes_worked / 60.0)
-        
-        # --- LÓGICA PARA DIAS NORMAIS (permanece a mesma) ---
-        else:
-            if len(day_punches) >= 2:
-                minutes_punches = sorted([datetime.fromtimestamp(p.timestamp / 1000).hour * 60 + datetime.fromtimestamp(p.timestamp / 1000).minute for p in day_punches])
-                worked_minutes = minutes_punches[-1] - minutes_punches[0]
-                
-                if worked_minutes > 0:
-                    overtime_hours = worked_minutes / 60.0
-                    if overtime_hours > 2.0:
-                        app_total_50 += 2.0
-                        app_total_100 += (overtime_hours - 2.0)
-                    else:
-                        app_total_50 += overtime_hours
-
-
-    # =========================================================================
-    # PASSO 4: Somar os totais do Sistema Principal com os totais do Novo Sistema
-    # =========================================================================
-    final_total_50 = main_system_total_50 + app_total_50
-    final_total_100 = main_system_total_100 + app_total_100
-
+def _combine_punches(main_punches: Dict[str, Optional[time]], app_punches: Dict[str, Optional[time]]) -> Dict[str, Optional[time]]:
+    """Combina batidas dando prioridade para as batidas do aplicativo."""
     return {
-        "status": "success",
-        "calculation": {
-            "month": request.month,
-            "year": request.year,
-            "app_hours_50": round(app_total_50, 2), # Adicionando para clareza no resultado
-            "app_hours_100": round(app_total_100, 2), # Adicionando para clareza no resultado
-            "final_total_hours_50": round(final_total_50, 2),
-            "final_total_hours_100": round(final_total_100, 2)
-        }
+        key: app_punches.get(key) or main_punches.get(key) 
+        for key in ["entry1", "exit1", "entry2", "exit2"]
     }
 
+def _calculate_minutes_standard(punches: Dict[str, Optional[time]]) -> int:
+    if not punches or not any(punches.values()): return 0
+    total_minutos = 0
+    dummy_date = date.today()
+    if punches.get("entry1") and punches.get("exit1"):
+        total_minutos += (datetime.combine(dummy_date, punches["exit1"]) - datetime.combine(dummy_date, punches["entry1"])).total_seconds() / 60
+    if punches.get("entry2") and punches.get("exit2"):
+        total_minutos += (datetime.combine(dummy_date, punches["exit2"]) - datetime.combine(dummy_date, punches["entry2"])).total_seconds() / 60
+    return int(round(total_minutos))
 
-@app.get("/main-system-hours")
-def get_main_system_hours(
-    employee_id: str = Query(..., description="Matrícula completa do funcionário (ex: 010112345)"),
-    year: int = Query(..., description="Ano do cálculo"),
-    month: int = Query(..., description="Mês do cálculo"),
-    db: Session = Depends(get_db_main)
-):
-    """
-    Busca as horas extras do sistema principal para um dado funcionário e mês,
-    já totalizando e separando em 50% e 100%.
-    Este é o PASSO 1 do fluxo, responsável por popular os campos na tela.
-    """
-    try:
-        # 1. Busca o dicionário contendo as horas extras de CADA DIA do mês.
-        daily_overtime = main_system_queries.get_overtime_from_main_system(
-            db=db,
-            employee_id=employee_id,
-            year=year,
-            month=month
-        )
-    except Exception as e:
-        # Se a busca no banco de dados principal falhar, retorne um erro claro.
-        raise HTTPException(
-            status_code=500,
-            detail=f"Não foi possível buscar os dados do sistema principal. Erro: {e}"
-        )
+def _calculate_minutes_overnight_by_day(punches_map: Dict[date, Dict[str, Optional[time]]]) -> Dict[date, int]:
+    worked_minutes_map = {}
+    all_punches = []
+    for d in sorted(punches_map.keys()):
+        day_punches = punches_map[d]
+        for punch_type in ["entry1", "exit1", "entry2", "exit2"]:
+            if day_punches.get(punch_type):
+                all_punches.append(datetime.combine(d, day_punches[punch_type]))
+    all_punches.sort()
 
-    # 2. Inicializa os contadores para os totais do mês.
-    total_hours_50 = 0.0
-    total_hours_100 = 0.0
-
-    # 3. Itera sobre as horas de cada dia para calcular os totais mensais.
-    # A regra aplicada é: as primeiras 2h extras do dia são 50%, o restante é 100%.
-    for daily_hours in daily_overtime.values():
-        if daily_hours > 2.0:
-            total_hours_50 += 2.0  # Adiciona as primeiras 2 horas ao total de 50%
-            total_hours_100 += (daily_hours - 2.0)  # Adiciona o excedente ao total de 100%
+    for i in range(0, len(all_punches) - 1, 2):
+        start_dt, end_dt = all_punches[i], all_punches[i+1]
+        if (end_dt - start_dt) > timedelta(hours=16): continue
+        
+        if start_dt.date() == end_dt.date():
+            duration = (end_dt - start_dt).total_seconds() / 60
+            worked_minutes_map[start_dt.date()] = worked_minutes_map.get(start_dt.date(), 0) + duration
         else:
-            total_hours_50 += daily_hours  # Se for 2h ou menos, tudo vai para o total de 50%
+            midnight = datetime.combine(end_dt.date(), time(0, 0))
+            duration_day1 = (midnight - start_dt).total_seconds() / 60
+            worked_minutes_map[start_dt.date()] = worked_minutes_map.get(start_dt.date(), 0) + duration_day1
+            duration_day2 = (end_dt - midnight).total_seconds() / 60
+            worked_minutes_map[end_dt.date()] = worked_minutes_map.get(end_dt.date(), 0) + duration_day2
             
-    # 4. Retorna a resposta JSON no formato que o frontend espera.
-    return {
-        "status": "success",
-        "main_system_hours_50": round(total_hours_50, 2),
-        "main_system_hours_100": round(total_hours_100, 2)
-    }
+    return {d: int(round(m)) for d, m in worked_minutes_map.items()}
 
-
-@app.post("/report")
-def generate_report(request: ReportRequest, db_app: Session = Depends(get_db_app), db_main: Session = Depends(get_db_main),admin_user: dict = Depends(security.get_current_user)):
-    """
-    Gera um relatório consolidado de horas extras para múltiplos funcionários
-    dentro de um período de tempo.
-    """
-    employee_ids_to_process = request.employee_ids
-
-    # Se a lista de IDs estiver vazia, pegamos todos os funcionários
-    if not employee_ids_to_process:
-        # Você precisaria de uma função que retorne todos os funcionários
-        # Ex: all_employees = db_app.query(models.Employee).all()
-        # employee_ids_to_process = [emp.employee_id for emp in all_employees]
-        pass # Implementar a busca de todos os funcionários
-
-    report_data = []
-
-    for emp_id in employee_ids_to_process:
-        # =================================================================
-        # REUTILIZE A LÓGICA DE CÁLCULO QUE JÁ TEMOS AQUI
-        # Esta parte seria uma nova função que você pode chamar tanto aqui
-        # quanto na rota /calculate para evitar duplicar código.
-        # =================================================================
-        
-        # Exemplo simplificado:
-        # 1. Calcular horas do sistema principal para o período
-        main_system_hours = calculate_main_system_totals(db_main, emp_id, request.start_date, request.end_date)
-        
-        # 2. Calcular horas do novo sistema para o período
-        new_system_hours = calculate_new_system_totals(db_app, emp_id, request.start_date, request.end_date)
-
-        # 3. Adicionar os dados compilados à lista do relatório
-        report_data.append({
-            "employee_id": emp_id,
-            # "employee_name": ... (buscar o nome do funcionário),
-            "main_system_hours_50": main_system_hours.get("total_50", 0),
-            "main_system_hours_100": main_system_hours.get("total_100", 0),
-            "new_system_hours_50": new_system_hours.get("total_50", 0),
-            "new_system_hours_100": new_system_hours.get("total_100", 0),
-        })
-
-    return {"status": "success", "data": report_data}
-
-
-@app.post("/token")
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    # Verifica se o usuário corresponde ao admin
-    is_correct_username = form_data.username == security.ADMIN_USERNAME
-    # Verifica se a senha corresponde à senha do admin
-    is_correct_password = security.verify_password(form_data.password, security.ADMIN_HASHED_PASSWORD)
-
-    if not (is_correct_username and is_correct_password):
-        raise HTTPException(
-            status_code=401,
-            detail="Usuário ou senha incorreta",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+def calculate_daily_balance(work_date: date, worked_minutes: int, planned_minutes: int, day_type: Optional[str]) -> Dict[str, int]:
+    calculated = {"normal": 0, "overtime_50": 0, "overtime_100": 0, "undertime": 0}
+    is_holiday_or_dsr = work_date in br_holidays or (day_type and day_type in ['D', 'C'])
     
-    access_token_expires = timedelta(minutes=security.ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = security.create_access_token(
-        data={"sub": security.ADMIN_USERNAME}, expires_delta=access_token_expires
-    )
+    if worked_minutes > 0:
+        if is_holiday_or_dsr and planned_minutes == 0:
+            calculated["overtime_100"] = worked_minutes
+        elif planned_minutes > 0:
+            balance = worked_minutes - planned_minutes
+            if balance > 0:
+                calculated["normal"] = planned_minutes
+                overtime_50 = min(balance, 120)
+                overtime_100 = balance - overtime_50
+                calculated["overtime_50"] = int(overtime_50)
+                calculated["overtime_100"] = int(overtime_100)
+            else:
+                calculated["normal"] = worked_minutes
+                calculated["undertime"] = balance
+        else:
+            calculated["overtime_50"] = worked_minutes
+    elif planned_minutes > 0:
+        calculated["undertime"] = -planned_minutes
+
+    return {k: int(v) for k, v in calculated.items()}
+
+
+# --- ENDPOINTS ---
+@app.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db_app)):
+    user = db.query(models.AppUser).filter(models.AppUser.username == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password", headers={"WWW-Authenticate": "Bearer"})
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(data={"sub": user.username}, expires_delta=access_token_expires)
     return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/users/register")
+def register_user(user: UserCreate, db: Session = Depends(get_db_app)):
+    if db.query(models.AppUser).filter(models.AppUser.username == user.username).first():
+        raise HTTPException(status_code=400, detail="Username already registered")
+    new_user = models.AppUser(username=user.username, hashed_password=get_password_hash(user.password))
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return {"status": "success", "username": new_user.username}
+
+@app.get("/employees/main")
+def get_all_employees(db: Session = Depends(get_db_main), current_user: models.AppUser = Depends(get_current_user)):
+    return {"status": "success", "employees": main_system_queries.get_all_employees_from_main_system(db)}
+
+@app.post("/punches/external", status_code=201)
+def receive_external_punches(request: ExternalPunchRequest, db: Session = Depends(get_db_app), current_user: models.AppUser = Depends(get_current_user)):
+    existing_punch = db.query(models.ExternalPunch).filter_by(employee_id=request.employee_id, work_date=request.work_date).first()
+    if existing_punch:
+        for key, value in request.dict().items(): setattr(existing_punch, key, value)
+        existing_punch.status = "pending"; message = "Registro de ponto externo atualizado."
+    else:
+        existing_punch = models.ExternalPunch(**request.dict()); db.add(existing_punch); message = "Registro de ponto externo criado."
+    db.commit(); db.refresh(existing_punch)
+    return {"status": "success", "message": message, "data": existing_punch}
+
+@app.get("/punches/external/{employee_id}/{work_date}")
+def get_external_punches_for_day(employee_id: str, work_date: date, db: Session = Depends(get_db_app), current_user: models.AppUser = Depends(get_current_user)):
+    punches = db.query(models.ExternalPunch).filter_by(employee_id=employee_id, work_date=work_date).first()
+    if not punches: raise HTTPException(status_code=404, detail="Nenhum registro de ponto externo encontrado para esta data.")
+    return punches
+
+@app.post("/overrides", status_code=201)
+def create_or_update_override_range(request: ManualOverrideRequest, db: Session = Depends(get_db_app), current_user: models.AppUser = Depends(get_current_user)):
+    if request.start_date > request.end_date:
+        raise HTTPException(status_code=400, detail="A data de início não pode ser posterior à data de fim.")
+    days_to_process = (request.end_date - request.start_date).days + 1
+    count = 0
+    for i in range(days_to_process):
+        current_date = request.start_date + timedelta(days=i)
+        existing = db.query(models.ManualOverride).filter_by(employee_id=request.employee_id, work_date=current_date).first()
+        if existing:
+            existing.override_type = request.override_type
+            existing.description = request.description
+        else:
+            new_override = models.ManualOverride(employee_id=request.employee_id, work_date=current_date, override_type=request.override_type, description=request.description)
+            db.add(new_override)
+        count += 1
+    db.commit()
+    return {"status": "success", "message": f"{count} dia(s) de '{request.override_type}' foram aplicados com sucesso."}
+
+@app.delete("/overrides", status_code=200)
+def delete_override_range(request: ManualOverrideRequest, db: Session = Depends(get_db_app), current_user: models.AppUser = Depends(get_current_user)):
+    if request.start_date > request.end_date:
+        raise HTTPException(status_code=400, detail="A data de início não pode ser posterior à data de fim.")
+    overrides_to_delete = db.query(models.ManualOverride).filter(
+        models.ManualOverride.employee_id == request.employee_id,
+        models.ManualOverride.work_date >= request.start_date,
+        models.ManualOverride.work_date <= request.end_date
+    ).all()
+    if not overrides_to_delete:
+        raise HTTPException(status_code=404, detail="Nenhum ajuste manual encontrado para este período.")
+    count = len(overrides_to_delete)
+    for override in overrides_to_delete:
+        db.delete(override)
+    db.commit()
+    return {"status": "success", "message": f"{count} ajuste(s) manual(is) foram removidos com sucesso."}
+    
+@app.post("/schedules/upload")
+async def upload_schedule_file(db: Session = Depends(get_db_app), file: UploadFile = File(...), current_user: models.AppUser = Depends(get_current_user)):
+    if not file.filename.endswith(('.csv', '.xlsx')):
+        raise HTTPException(status_code=400, detail="Formato de arquivo inválido. Por favor, envie um .csv ou .xlsx")
+    try:
+        if file.filename.endswith('.csv'):
+            df = pd.read_csv(file.file)
+        else:
+            df = pd.read_excel(file.file)
+        required_columns = ['employee_id', 'work_date', 'day_type', 'shift_code']
+        if not all(col in df.columns for col in required_columns):
+            raise HTTPException(status_code=400, detail=f"O arquivo deve conter as colunas: {required_columns}")
+        success_count, error_count = 0, 0
+        for _, row in df.iterrows():
+            try:
+                employee_id = str(row['employee_id'])
+                work_date = pd.to_datetime(row['work_date']).date()
+                day_type = str(row['day_type']).upper()
+                shift_code = str(row['shift_code']) if pd.notna(row['shift_code']) else None
+                if day_type not in ['TRABALHO', 'FOLGA']:
+                    error_count += 1
+                    continue
+                existing_schedule = db.query(models.EscalaDiaria).filter_by(employee_id=employee_id, work_date=work_date).first()
+                if existing_schedule:
+                    existing_schedule.day_type = day_type
+                    existing_schedule.shift_code = shift_code
+                else:
+                    new_schedule = models.EscalaDiaria(employee_id=employee_id, work_date=work_date, day_type=day_type, shift_code=shift_code)
+                    db.add(new_schedule)
+                success_count += 1
+            except Exception as e:
+                logger.error(f"Erro ao processar linha da escala: {row}. Erro: {e}")
+                error_count += 1
+        db.commit()
+        return {"status": "success", "message": f"Arquivo processado. {success_count} escalas salvas, {error_count} linhas com erro."}
+    except Exception as e:
+        logger.error(f"Falha ao processar o arquivo de escala: {e}")
+        raise HTTPException(status_code=500, detail=f"Não foi possível processar o arquivo. Erro: {e}")
+
+@app.post("/report/monthly", response_model=List[DetailedReportData])
+def generate_detailed_monthly_report(request: MonthlyReportRequest, db_app: Session = Depends(get_db_app), db_main: Session = Depends(get_db_main), current_user: models.AppUser = Depends(get_current_user)):
+    report_data = []
+    all_employees_map = {emp['employee_id']: emp['name'] for emp in main_system_queries.get_all_employees_from_main_system(db_main)}
+    start_date = date(request.year, request.month, 1)
+    _, num_days_in_month = calendar.monthrange(request.year, request.month)
+    end_date = date(request.year, request.month, num_days_in_month)
+    
+    for emp_id in request.employee_ids:
+        default_shift_code = main_system_queries.get_employee_shift_code(db_main, emp_id)
+        if not default_shift_code:
+            logger.warning(f"Pulando funcionário {emp_id}: turno padrão não encontrado.")
+            continue
+        default_shift_info = main_system_queries.get_shift_info(db_main, default_shift_code)
+        
+        main_punches_map = {}
+        app_punches_map = {}
+        combined_punches_map = {}
+        
+        end_fetch_date = end_date + timedelta(days=1)
+        current_date_fetch = start_date
+        while current_date_fetch <= end_fetch_date:
+            main_punches = main_system_queries.get_main_system_punches_for_day(db_main, emp_id, current_date_fetch)
+            app_punches_db = db_app.query(models.ExternalPunch).filter_by(employee_id=emp_id, work_date=current_date_fetch).first()
+            app_punches = {"entry1": app_punches_db.entry1 if app_punches_db else None, "exit1": app_punches_db.exit1 if app_punches_db else None, "entry2": app_punches_db.entry2 if app_punches_db else None, "exit2": app_punches_db.exit2 if app_punches_db else None}
+            
+            main_punches_map[current_date_fetch] = main_punches
+            app_punches_map[current_date_fetch] = app_punches
+            
+            combined_punches_map[current_date_fetch] = _combine_punches(main_punches, app_punches)
+            current_date_fetch += timedelta(days=1)
+
+        planned_start_time = default_shift_info.get("planned_start_time")
+        is_overnight_shift = planned_start_time and planned_start_time.hour >= 18
+        
+        worked_minutes_per_day = {}
+        if is_overnight_shift:
+            logger.info(f"Funcionário {emp_id} detectado com turno NOTURNO. Usando lógica de cálculo avançada.")
+            worked_minutes_per_day = _calculate_minutes_overnight_by_day(combined_punches_map)
+        else:
+            logger.info(f"Funcionário {emp_id} detectado com turno DIURNO. Usando lógica de cálculo padrão.")
+            for current_date, day_punches in combined_punches_map.items():
+                if start_date <= current_date <= end_date:
+                    worked_minutes_per_day[current_date] = _calculate_minutes_standard(day_punches)
+        
+        daily_breakdown_list = []
+        totals_in_minutes = {"normal": 0, "overtime_50": 0, "overtime_100": 0, "undertime": 0}
+
+        for day in range(1, num_days_in_month + 1):
+            current_date = date(request.year, request.month, day)
+            
+            planned_minutes = 0
+            day_type = None
+            status = None
+            
+            manual_override = db_app.query(models.ManualOverride).filter_by(employee_id=emp_id, work_date=current_date).first()
+            if manual_override:
+                status = manual_override.override_type
+                calculated_minutes = {"normal": 0, "overtime_50": 0, "overtime_100": 0, "undertime": 0}
+            else:
+                daily_schedule = db_app.query(models.EscalaDiaria).filter_by(employee_id=emp_id, work_date=current_date).first()
+                if daily_schedule:
+                    if daily_schedule.day_type == 'FOLGA':
+                        status = 'FOLGA (Escala)'
+                        planned_minutes = 0
+                    else:
+                        shift_code_for_the_day = daily_schedule.shift_code or default_shift_code
+                        shift_info = main_system_queries.get_shift_info(db_main, shift_code_for_the_day) if shift_code_for_the_day else default_shift_info
+                        filial = emp_id[:4]
+                        day_of_week = (current_date.isoweekday() % 7) + 1
+                        cycle_week = get_cycle_week(current_date, request.cycle_start_date, shift_info["weeks_in_cycle"])
+                        schedule_info = main_system_queries.get_work_schedule_info_for_day(db_main, shift_code_for_the_day, filial, cycle_week, day_of_week)
+                        planned_minutes = schedule_info.get('minutes', 0)
+                        day_type = schedule_info.get('type')
+                else:
+                    filial = emp_id[:4]
+                    day_of_week = (current_date.isoweekday() % 7) + 1
+                    cycle_week = get_cycle_week(current_date, request.cycle_start_date, default_shift_info["weeks_in_cycle"])
+                    schedule_info = main_system_queries.get_work_schedule_info_for_day(db_main, default_shift_code, filial, cycle_week, day_of_week)
+                    planned_minutes = schedule_info.get('minutes', 0)
+                    day_type = schedule_info.get('type')
+                
+                worked_minutes = worked_minutes_per_day.get(current_date, 0)
+                calculated_minutes = calculate_daily_balance(current_date, worked_minutes, planned_minutes, day_type)
+                if status is None and (current_date in br_holidays or (day_type and day_type in ['D', 'C'])):
+                    status = day_type
+            
+            daily_breakdown_list.append(DailyBreakdown(
+                date=current_date, 
+                main_system_punches=main_punches_map.get(current_date, {}),
+                app_punches=app_punches_map.get(current_date, {}),
+                calculated_minutes=calculated_minutes, 
+                status=status
+            ))
+            for key in totals_in_minutes:
+                totals_in_minutes[key] += calculated_minutes.get(key, 0)
+            
+        report_data.append(DetailedReportData(
+            employee_id=emp_id,
+            employee_name=all_employees_map.get(emp_id, "Nome não encontrado"),
+            shift_description=f"{default_shift_info['description']} ({'Noturno' if is_overnight_shift else 'Diurno'})",
+            daily_breakdown=daily_breakdown_list,
+            totals_in_minutes=totals_in_minutes
+        ))
+    return report_data

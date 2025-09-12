@@ -1,50 +1,102 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="pt-br">
 <head>
     <meta charset="UTF-8">
-    <title>Relatório de Horas Extras</title>
-    <link rel="stylesheet" href="style.css"> </head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Relatório de Horas</title>
+    <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet" />
+    <link rel="stylesheet" href="style.css">
+</head>
 <body>
     <div class="container">
-        <h1>Relatório de Horas Extras</h1>
+        <img src="logo_reunidas.png" alt="Logo da Empresa" class="logo">
+        <h1>Relatório Consolidado de Horas</h1>
 
-        <div class="filters-card">
-            <h2>Filtros</h2>
-            <div class="form-group">
-                <label for="start-date">Data de Início:</label>
-                <input type="date" id="start-date" required>
-            </div>
-            <div class="form-group">
-                <label for="end-date">Data de Fim:</label>
-                <input type="date" id="end-date" required>
-            </div>
-            <div class="form-group">
-                <label for="employee-select">Funcionários:</label>
-                <select id="employee-select" multiple size="8"></select>
-                <button id="select-all-btn">Selecionar Todos</button>
-            </div>
-            <button id="generate-report-btn">Gerar Relatório</button>
-            <button id="export-csv-btn" style="display:none;">Exportar para CSV</button>
+        <div id="login-section">
+            <h2>Autenticação</h2>
+            <input type="text" id="username-input" placeholder="Utilizador">
+            <input type="password" id="password-input" placeholder="Senha">
+            <button id="login-btn">Entrar</button>
+            <p id="login-error" class="error-message"></p>
         </div>
 
-        <div id="results-area">
-            <div id="loader" class="loader" style="display:none;"></div>
-            <table id="report-table" class="modern-table">
-                <thead>
-                    <tr>
-                        <th>Funcionário</th>
-                        <th>Horas 50% (Sis. Principal)</th>
-                        <th>Horas 100% (Sis. Principal)</th>
-                        <th>Horas 50% (Novo Sis.)</th>
-                        <th>Horas 100% (Novo Sis.)</th>
-                        <th>TOTAL GERAL 50%</th>
-                        <th>TOTAL GERAL 100%</th>
-                    </tr>
-                </thead>
-                <tbody id="report-table-body">
-                </tbody>
-            </table>
+        <div id="report-section" style="display: none;">
+            <div class="filters">
+                <div class="filter-item">
+                    <label for="employee-select">Funcionário(s)</label>
+                    <select id="employee-select" name="employees[]" multiple="multiple" style="width: 100%;"></select>
+                </div>
+                <div class="filter-group">
+                    <div class="filter-item">
+                        <label for="cycle-start-date-input">Data de Início do Ciclo</label>
+                        <input type="date" id="cycle-start-date-input">
+                    </div>
+                    <div class="filter-item">
+                        <label for="month-input">Mês/Ano do Relatório</label>
+                        <input type="month" id="month-input">
+                    </div>
+                </div>
+                <button id="generate-report-btn">Gerar Relatório</button>
+            </div>
+
+            <hr>
+            <h3>Ajustes Manuais por Período</h3>
+            <p>Use esta seção para lançar folgas, férias ou atestados para um ou mais dias.</p>
+            <div class="filters" id="override-section">
+                <div class="filter-item">
+                    <label for="override-employee-select">Funcionário</label>
+                    <select id="override-employee-select" style="width: 100%;"></select>
+                </div>
+                <div class="filter-group">
+                    <div class="filter-item">
+                        <label for="override-start-date-input">Data de Início</label>
+                        <input type="date" id="override-start-date-input">
+                    </div>
+                    <div class="filter-item">
+                        <label for="override-end-date-input">Data de Fim</label>
+                        <input type="date" id="override-end-date-input">
+                    </div>
+                </div>
+                <div class="filter-item">
+                    <label for="override-type-select">Tipo de Ajuste</label>
+                    <select id="override-type-select">
+                        <option value="">Selecione...</option>
+                        <option value="FOLGA">Folga</option>
+                        <option value="FÉRIAS">Férias</option>
+                        <option value="ATESTADO">Atestado Médico</option>
+                    </select>
+                </div>
+                <div class="filter-item button-group">
+                    <button id="save-override-btn">Salvar Ajuste</button>
+                    <button id="delete-override-btn" class="danger">Remover Ajuste</button>
+                </div>
+            </div>
+            <div id="override-message" style="text-align: center; margin-top: 10px;"></div>
+            <hr>
+
+            <h3>Importar Escala Mensal (CSV/Excel)</h3>
+            <p>
+                Faça o upload de um arquivo com as colunas: 
+                <strong>employee_id, work_date, day_type, shift_code</strong>
+            </p>
+            <div class="filters" id="import-section">
+                <div class="filter-item">
+                    <label for="schedule-file-input">Selecione o arquivo de escala</label>
+                    <input type="file" id="schedule-file-input" accept=".csv, .xlsx, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel">
+                </div>
+                <div class="filter-item button-group">
+                    <button id="upload-schedule-btn">Importar Escala</button>
+                </div>
+            </div>
+            <div id="upload-message" style="text-align: center; margin-top: 10px;"></div>
+            <hr>
+
+            <div id="report-result" class="mt-4"></div>
         </div>
     </div>
-    <script src="relatorio.js"></script> </body>
+
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
+    <script src="relatorio.js"></script>
+</body>
 </html>

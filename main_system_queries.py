@@ -1,81 +1,163 @@
 import logging
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from datetime import datetime, date
-from typing import Dict
-from collections import defaultdict
+from datetime import datetime, date, time
+from typing import Dict, Optional, List, Any
 
 logger = logging.getLogger(__name__)
 
-def get_overtime_from_main_system(db: Session, employee_id: str, year: int, month: int) -> Dict[date, float]:
-    """
-    Conecta-se ao banco de dados do sistema principal (SQL Server) e retorna um
-    dicionário mapeando cada dia do mês ao seu total de horas extras.
-    """
-    logger.info(f"Buscando horas do sistema principal para Matrícula: {employee_id}, Mês/Ano: {month}/{year}")
-
-    filial = employee_id[:4]
-    matricula = employee_id[4:]
-
-    # Consulta SQL que busca as horas extras PARA CADA DIA
+def get_all_employees_from_main_system(db: Session) -> List[Dict[str, str]]:
+    logger.info("Buscando lista de todos os funcionários ativos do sistema principal com descrição de turno.")
     sql_query = text("""
-        WITH BatidasDiarias AS (
-            SELECT
-                P8_DATA,
-                MAX(CASE WHEN P8_TPMARCA = '1E' THEN FLOOR(P8_HORA) * 60 + (P8_HORA - FLOOR(P8_HORA)) * 100 ELSE NULL END) AS min_1e,
-                MAX(CASE WHEN P8_TPMARCA = '1S' THEN FLOOR(P8_HORA) * 60 + (P8_HORA - FLOOR(P8_HORA)) * 100 ELSE NULL END) AS min_1s,
-                MAX(CASE WHEN P8_TPMARCA = '2E' THEN FLOOR(P8_HORA) * 60 + (P8_HORA - FLOOR(P8_HORA)) * 100 ELSE NULL END) AS min_2e,
-                MAX(CASE WHEN P8_TPMARCA = '2S' THEN FLOOR(P8_HORA) * 60 + (P8_HORA - FLOOR(P8_HORA)) * 100 ELSE NULL END) AS min_2s
-            FROM
-                SP8010
-            WHERE
-                P8_FILIAL = :filial
-                AND P8_MAT = :matricula
-                AND SUBSTRING(P8_DATA, 1, 4) = :p_year
-                AND SUBSTRING(P8_DATA, 5, 2) = :p_month
-                AND P8_APONTA = 'S' -- Garante que a batida é válida para apontamento
-                AND (D_E_L_E_T_ IS NULL OR D_E_L_E_T_ <> '*') -- Garante que o registro não foi deletado
-            GROUP BY
-                P8_DATA
-        ),
-        JornadaCalculada AS (
-            SELECT
-                P8_DATA,
-                (ISNULL(min_1s, 0) - ISNULL(min_1e, 0)) + (ISNULL(min_2s, 0) - ISNULL(min_2e, 0)) AS total_minutos_jornada
-            FROM
-                BatidasDiarias
-        )
-        SELECT 
-            P8_DATA as dia,
-            -- Retorna as horas extras calculadas para este dia
-            CAST(
-                CASE 
-                    WHEN total_minutos_jornada > 528
-                    THEN (total_minutos_jornada - 528) / 60.0
-                    ELSE 0 
-                END 
-            AS DECIMAL(10,2)) AS HorasExtras
-        FROM JornadaCalculada
-        WHERE total_minutos_jornada > 0;
+        SELECT
+            sra.RA_FILIAL AS filial,
+            sra.RA_MAT AS matricula,
+            TRIM(sra.RA_NOME) AS nome,
+            MAX(TRIM(sr6.R6_DESC)) AS turno_descricao
+        FROM
+            SRA010 AS sra
+        LEFT JOIN
+            SR6010 AS sr6 ON sra.RA_TNOTRAB = sr6.R6_TURNO 
+            AND (sr6.R6_FILIAL = sra.RA_FILIAL OR sr6.R6_FILIAL = '')
+            AND sr6.D_E_L_E_T_ <> '*'
+        WHERE
+            sra.RA_SITFOLH <> 'D'
+            AND (sra.D_E_L_E_T_ IS NULL OR sra.D_E_L_E_T_ <> '*')
+        GROUP BY
+            sra.RA_FILIAL, sra.RA_MAT, sra.RA_NOME
+        ORDER BY
+            sra.RA_NOME;
     """)
-
-    main_system_overtime_per_day: Dict[date, float] = defaultdict(float)
+    employees = []
     try:
-        results = db.execute(
-            sql_query,
-            {"filial": filial, "matricula": matricula, "p_year": str(year), "p_month": str(month).zfill(2)}
-        ).fetchall()
-
-        # Constrói o dicionário que o main.py espera
+        results = db.execute(sql_query).fetchall()
         for row in results:
-            dia_str, horas_extras = row
-            if horas_extras and float(horas_extras) > 0:
-                dia_date = datetime.strptime(dia_str, '%Y%m%d').date()
-                main_system_overtime_per_day[dia_date] = float(horas_extras)
-            
-        return main_system_overtime_per_day
-        
+            employees.append({
+                "employee_id": f"{row.filial}{row.matricula}",
+                "name": row.nome,
+                "shift_description": row.turno_descricao or "Turno não especificado"
+            })
+        logger.info(f"Encontrados {len(employees)} funcionários ativos.")
+        return employees
     except Exception as e:
-        logger.error(f"Erro ao consultar o banco de dados principal: {e}")
+        logger.error(f"Erro ao buscar lista de funcionários do sistema principal: {e}")
         raise e
 
+def get_shift_info(db: Session, shift_code: str) -> Dict:
+    shift_info = {
+        "description": f"Turno {shift_code}", 
+        "weeks_in_cycle": 1,
+        "planned_start_time": None
+    }
+    
+    desc_query = text("SELECT TOP 1 TRIM(R6_DESC) FROM SR6010 WHERE R6_TURNO = :shift_code AND D_E_L_E_T_ <> '*'")
+    description = db.execute(desc_query, {"shift_code": shift_code}).scalar_one_or_none()
+    if description:
+        shift_info["description"] = description
+
+    cycle_query = text("SELECT MAX(CAST(PJ_SEMANA AS INT)) FROM SPJ010 WHERE PJ_TURNO = :shift_code AND D_E_L_E_T_ <> '*'")
+    weeks = db.execute(cycle_query, {"shift_code": shift_code}).scalar_one_or_none()
+    if weeks and weeks > 0:
+        shift_info["weeks_in_cycle"] = weeks
+
+    start_time_query = text("""
+        SELECT TOP 1 PJ_ENTRA1 FROM SPJ010 WHERE PJ_TURNO = :shift_code AND PJ_ENTRA1 > 0 AND D_E_L_E_T_ <> '*' ORDER BY PJ_SEMANA, PJ_DIA
+    """)
+    start_time_float = db.execute(start_time_query, {"shift_code": shift_code}).scalar_one_or_none()
+    if start_time_float is not None:
+        hour = int(start_time_float)
+        minute = int(round((start_time_float - hour) * 100))
+        if 0 <= minute <= 59:
+             shift_info["planned_start_time"] = time(hour, minute)
+
+    return shift_info
+
+def get_work_schedule_info_for_day(db: Session, shift_code: str, filial: str, cycle_week: int, day_of_week: int) -> Dict[str, Any]:
+    filial_curta = filial[:2]
+    semana_formatada = str(cycle_week).zfill(2)
+    dia_formatado = str(day_of_week)
+    logger.info(f"VERIFICANDO BANCO: PJ_TURNO='{shift_code}', PJ_FILIAL='{filial_curta}', PJ_SEMANA='{semana_formatada}', PJ_DIA='{dia_formatado}'")
+    default_result = {"minutes": 0, "type": "F"}
+    sql_query = text("""
+        SELECT TOP 1 
+            (ISNULL(PJ_HRSTRAB, 0) + ISNULL(PJ_HRSTRA2, 0)) AS horas_trabalhadas, 
+            PJ_TPDIA
+        FROM SPJ010
+        WHERE TRIM(PJ_TURNO) = :shift_code
+          AND (TRIM(PJ_FILIAL) = :filial OR TRIM(PJ_FILIAL) = '')
+          AND TRIM(PJ_SEMANA) = :cycle_week
+          AND TRIM(PJ_DIA) = :day_of_week
+          AND D_E_L_E_T_ <> '*'
+        ORDER BY PJ_FILIAL DESC;
+    """)
+    try:
+        result = db.execute(sql_query, {"shift_code": shift_code, "filial": filial_curta, "cycle_week": semana_formatada, "day_of_week": dia_formatado}).fetchone()
+        if result:
+            hours = float(result.horas_trabalhadas or 0)
+            parte_horas = int(hours)
+            parte_minutos = int(round((hours - parte_horas) * 100))
+            total_minutes = (parte_horas * 60) + parte_minutos
+            day_type = result.PJ_TPDIA.strip() if result.PJ_TPDIA else "S"
+            logger.info(f"SUCESSO! Jornada encontrada para o turno {shift_code}: {total_minutes} minutos, Tipo: {day_type}.")
+            return {"minutes": total_minutes, "type": day_type}
+        else:
+            logger.warning(f"Jornada não encontrada para o turno {shift_code} na filial {filial_curta}. Assumindo folga.")
+            return default_result
+    except Exception as e:
+        logger.error(f"Erro ao buscar jornada de trabalho para o turno {shift_code}: {e}")
+        return default_result
+
+def get_main_system_punches_for_day(db: Session, employee_id: str, work_date: date) -> Dict[str, Optional[time]]:
+    logger.info(f"Buscando batidas do sistema principal para Matrícula: {employee_id}, Data: {work_date}")
+    filial_completa = employee_id[:4]
+    matricula = employee_id[4:]
+    data_str = work_date.strftime('%Y%m%d')
+    sql_query = text("""
+        SELECT
+            MAX(CASE WHEN TRIM(P8_TPMARCA) = '1E' THEN P8_HORA ELSE NULL END) AS hora_1e,
+            MAX(CASE WHEN TRIM(P8_TPMARCA) = '1S' THEN P8_HORA ELSE NULL END) AS hora_1s,
+            MAX(CASE WHEN TRIM(P8_TPMARCA) = '2E' THEN P8_HORA ELSE NULL END) AS hora_2e,
+            MAX(CASE WHEN TRIM(P8_TPMARCA) = '2S' THEN P8_HORA ELSE NULL END) AS hora_2s
+        FROM SP8010
+        WHERE TRIM(P8_FILIAL) = :filial AND TRIM(P8_MAT) = :matricula AND TRIM(P8_DATA) = :data
+          AND TRIM(P8_APONTA) = 'S' AND (D_E_L_E_T_ IS NULL OR D_E_L_E_T_ <> '*')
+    """)
+    def convert_to_time(hour_float: Optional[float]) -> Optional[time]:
+        if hour_float is None: return None
+        hour = int(hour_float)
+        minute = int(round((hour_float - hour) * 100))
+        if not 0 <= minute <= 59:
+            logger.warning(f"Minuto inválido ({minute}) ao converter hora {hour_float}. Retornando None.")
+            return None
+        return time(hour, minute)
+    try:
+        result = db.execute(sql_query, {"filial": filial_completa, "matricula": matricula, "data": data_str}).fetchone()
+        if result and any(result):
+            punches = {"entry1": convert_to_time(result.hora_1e), "exit1": convert_to_time(result.hora_1s), "entry2": convert_to_time(result.hora_2e), "exit2": convert_to_time(result.hora_2s)}
+            logger.info(f"SUCESSO! Batidas encontradas para {employee_id} em {work_date}: {punches}")
+            return punches
+        logger.warning(f"Nenhuma batida de ponto encontrada para {employee_id} na data {work_date} (P8_APONTA='S')")
+        return {"entry1": None, "exit1": None, "entry2": None, "exit2": None}
+    except Exception as e:
+        logger.error(f"Erro ao consultar o banco de dados principal para batidas de ponto: {e}")
+        raise e
+
+def get_employee_shift_code(db: Session, employee_id: str) -> Optional[str]:
+    logger.info(f"Buscando código do turno para o funcionário: {employee_id}")
+    filial = employee_id[:4]
+    matricula = employee_id[4:]
+    sql_query = text("""
+        SELECT TOP 1 TRIM(RA_TNOTRAB) AS shift_code FROM SRA010
+        WHERE RA_FILIAL = :filial AND RA_MAT = :matricula AND (D_E_L_E_T_ IS NULL OR D_E_L_E_T_ <> '*')
+    """)
+    try:
+        result = db.execute(sql_query, {"filial": filial, "matricula": matricula}).scalar_one_or_none()
+        if result:
+            logger.info(f"Turno encontrado para {employee_id}: {result}")
+            return result
+        else:
+            logger.warning(f"Nenhum turno encontrado para o funcionário {employee_id}")
+            return None
+    except Exception as e:
+        logger.error(f"Erro ao buscar turno para o funcionário {employee_id}: {e}")
+        return None
