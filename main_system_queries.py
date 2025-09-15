@@ -112,7 +112,18 @@ def get_main_system_punches_for_day(db: Session, employee_id: str, work_date: da
     filial_completa = employee_id[:4]
     matricula = employee_id[4:]
     data_str = work_date.strftime('%Y%m%d')
-    sql_query = text("""
+
+    def convert_to_time(hour_float: Optional[float]) -> Optional[time]:
+        if hour_float is None: return None
+        hour = int(hour_float)
+        minute = int(round((hour_float - hour) * 100))
+        if not 0 <= minute <= 59:
+            logger.warning(f"Minuto inválido ({minute}) ao converter hora {hour_float}. Retornando None.")
+            return None
+        return time(hour, minute)
+
+    # 1. Tenta buscar na tabela de movimentações (SP8010)
+    sql_query_sp8 = text("""
         SELECT
             MAX(CASE WHEN TRIM(P8_TPMARCA) = '1E' THEN P8_HORA ELSE NULL END) AS hora_1e,
             MAX(CASE WHEN TRIM(P8_TPMARCA) = '1S' THEN P8_HORA ELSE NULL END) AS hora_1s,
@@ -122,25 +133,46 @@ def get_main_system_punches_for_day(db: Session, employee_id: str, work_date: da
         WHERE TRIM(P8_FILIAL) = :filial AND TRIM(P8_MAT) = :matricula AND TRIM(P8_DATA) = :data
           AND TRIM(P8_APONTA) = 'S' AND (D_E_L_E_T_ IS NULL OR D_E_L_E_T_ <> '*')
     """)
-    def convert_to_time(hour_float: Optional[float]) -> Optional[time]:
-        if hour_float is None: return None
-        hour = int(hour_float)
-        minute = int(round((hour_float - hour) * 100))
-        if not 0 <= minute <= 59:
-            logger.warning(f"Minuto inválido ({minute}) ao converter hora {hour_float}. Retornando None.")
-            return None
-        return time(hour, minute)
     try:
-        result = db.execute(sql_query, {"filial": filial_completa, "matricula": matricula, "data": data_str}).fetchone()
-        if result and any(result):
-            punches = {"entry1": convert_to_time(result.hora_1e), "exit1": convert_to_time(result.hora_1s), "entry2": convert_to_time(result.hora_2e), "exit2": convert_to_time(result.hora_2s)}
-            logger.info(f"SUCESSO! Batidas encontradas para {employee_id} em {work_date}: {punches}")
+        result_sp8 = db.execute(sql_query_sp8, {"filial": filial_completa, "matricula": matricula, "data": data_str}).fetchone()
+        if result_sp8 and any(result_sp8):
+            punches = {
+                "entry1": convert_to_time(result_sp8.hora_1e), "exit1": convert_to_time(result_sp8.hora_1s),
+                "entry2": convert_to_time(result_sp8.hora_2e), "exit2": convert_to_time(result_sp8.hora_2s)
+            }
+            logger.info(f"SUCESSO! Batidas encontradas em SP8010 para {employee_id} em {work_date}: {punches}")
             return punches
-        logger.warning(f"Nenhuma batida de ponto encontrada para {employee_id} na data {work_date} (P8_APONTA='S')")
-        return {"entry1": None, "exit1": None, "entry2": None, "exit2": None}
     except Exception as e:
-        logger.error(f"Erro ao consultar o banco de dados principal para batidas de ponto: {e}")
+        logger.error(f"Erro ao consultar SP8010 para batidas de ponto: {e}")
+
+    logger.warning(f"Nenhuma batida encontrada em SP8010 para {employee_id}. Verificando histórico (SPG010)...")
+
+    # 2. Se não encontrou, busca na tabela de histórico (SPG010)
+    sql_query_spg = text("""
+        SELECT
+            MAX(CASE WHEN TRIM(PG_TPMARCA) = '1E' THEN PG_HORA ELSE NULL END) AS hora_1e,
+            MAX(CASE WHEN TRIM(PG_TPMARCA) = '1S' THEN PG_HORA ELSE NULL END) AS hora_1s,
+            MAX(CASE WHEN TRIM(PG_TPMARCA) = '2E' THEN PG_HORA ELSE NULL END) AS hora_2e,
+            MAX(CASE WHEN TRIM(PG_TPMARCA) = '2S' THEN PG_HORA ELSE NULL END) AS hora_2s
+        FROM SPG010
+        WHERE TRIM(PG_FILIAL) = :filial AND TRIM(PG_MAT) = :matricula AND TRIM(PG_DATA) = :data
+          AND TRIM(PG_APONTA) = 'S' AND (D_E_L_E_T_ IS NULL OR D_E_L_E_T_ <> '*')
+    """)
+    try:
+        result_spg = db.execute(sql_query_spg, {"filial": filial_completa, "matricula": matricula, "data": data_str}).fetchone()
+        if result_spg and any(result_spg):
+            punches = {
+                "entry1": convert_to_time(result_spg.hora_1e), "exit1": convert_to_time(result_spg.hora_1s),
+                "entry2": convert_to_time(result_spg.hora_2e), "exit2": convert_to_time(result_spg.hora_2s)
+            }
+            logger.info(f"SUCESSO! Batidas encontradas no histórico SPG010 para {employee_id} em {work_date}: {punches}")
+            return punches
+    except Exception as e:
+        logger.error(f"Erro ao consultar o histórico SPG010 para batidas de ponto: {e}")
         raise e
+
+    logger.warning(f"Nenhuma batida de ponto encontrada para {employee_id} na data {work_date} (nem em SP8, nem em SPG)")
+    return {"entry1": None, "exit1": None, "entry2": None, "exit2": None}
 
 def get_employee_shift_code(db: Session, employee_id: str) -> Optional[str]:
     logger.info(f"Buscando código do turno para o funcionário: {employee_id}")
@@ -161,3 +193,35 @@ def get_employee_shift_code(db: Session, employee_id: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"Erro ao buscar turno para o funcionário {employee_id}: {e}")
         return None
+
+def get_standard_shift_minutes(db: Session, shift_code: str) -> int:
+    """
+    Busca a jornada de trabalho padrão em minutos para um determinado turno,
+    pegando o valor de horas mais comum (moda) diferente de zero.
+    """
+    logger.info(f"Buscando jornada padrão para o turno: {shift_code}")
+    sql_query = text("""
+        SELECT TOP 1
+            (ISNULL(PJ_HRSTRAB, 0) + ISNULL(PJ_HRSTRA2, 0)) AS horas_trabalhadas
+        FROM SPJ010
+        WHERE TRIM(PJ_TURNO) = :shift_code
+          AND (ISNULL(PJ_HRSTRAB, 0) + ISNULL(PJ_HRSTRA2, 0)) > 0
+          AND D_E_L_E_T_ <> '*'
+        GROUP BY (ISNULL(PJ_HRSTRAB, 0) + ISNULL(PJ_HRSTRA2, 0))
+        ORDER BY COUNT(*) DESC;
+    """)
+    try:
+        result = db.execute(sql_query, {"shift_code": shift_code}).scalar_one_or_none()
+        if result:
+            hours = float(result or 0)
+            parte_horas = int(hours)
+            parte_minutos = int(round((hours - parte_horas) * 100))
+            total_minutes = (parte_horas * 60) + parte_minutos
+            logger.info(f"SUCESSO! Jornada padrão encontrada para o turno {shift_code}: {total_minutes} minutos.")
+            return total_minutes
+        else:
+            logger.warning(f"Nenhuma jornada padrão encontrada para o turno {shift_code}. Retornando 0.")
+            return 0
+    except Exception as e:
+        logger.error(f"Erro ao buscar jornada padrão para o turno {shift_code}: {e}")
+        return 0
