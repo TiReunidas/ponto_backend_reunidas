@@ -19,6 +19,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import models
 from database import SessionLocal_App, engine_app, SessionLocal_Main
 import main_system_queries
+from main_system_queries import (
+    get_schedule_times_for_day,
+    get_raw_punches_for_period
+)
 
 # --- CONFIGURAÇÕES GERAIS ---
 logging.basicConfig(level=logging.INFO)
@@ -43,7 +47,7 @@ def get_db_main():
     db = SessionLocal_Main()
     try: yield db
     finally: db.close()
-        
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 
@@ -83,6 +87,10 @@ def get_cycle_week(work_date: date, start_date: date, weeks_in_cycle: int) -> in
 # --- Pydantic Models ---
 class UserCreate(BaseModel): username: str; password: str
 class Token(BaseModel): access_token: str; token_type: str
+class RelatorioRequest(BaseModel):
+    matricula: str
+    data_inicio: str
+    data_fim: str
 class ExternalPunchRequest(BaseModel): employee_id: str; work_date: date; entry1: Optional[time] = None; exit1: Optional[time] = None; entry2: Optional[time] = None; exit2: Optional[time] = None
 class CalculatedMinutes(BaseModel):
     normal: int
@@ -116,68 +124,25 @@ class ManualOverrideRequest(BaseModel):
 # --- LÓGICA DE NEGÓCIO ---
 
 def _combine_punches(main_punches: Dict[str, Optional[time]], app_punches: Dict[str, Optional[time]]) -> Dict[str, Optional[time]]:
-    """Combina batidas dando prioridade para as batidas do aplicativo."""
     return {
-        key: app_punches.get(key) or main_punches.get(key) 
+        key: app_punches.get(key) or main_punches.get(key)
         for key in ["entry1", "exit1", "entry2", "exit2"]
     }
 
-def _calculate_minutes_standard(punches: Dict[str, Optional[time]]) -> int:
-    if not punches or not any(punches.values()): return 0
-    total_minutos = 0
-    dummy_date = date.today()
-    if punches.get("entry1") and punches.get("exit1"):
-        total_minutos += (datetime.combine(dummy_date, punches["exit1"]) - datetime.combine(dummy_date, punches["entry1"])).total_seconds() / 60
-    if punches.get("entry2") and punches.get("exit2"):
-        total_minutos += (datetime.combine(dummy_date, punches["exit2"]) - datetime.combine(dummy_date, punches["entry2"])).total_seconds() / 60
-    return int(round(total_minutos))
-
-def _calculate_minutes_overnight_by_day(punches_map: Dict[date, Dict[str, Optional[time]]]) -> Dict[date, int]:
-    worked_minutes_map = {}
-    all_punches = []
-    # 1. Coleta e ordena todas as batidas em uma única linha do tempo
-    for d in sorted(punches_map.keys()):
-        day_punches = punches_map[d]
-        for punch_type in ["entry1", "exit1", "entry2", "exit2"]:
-            if day_punches.get(punch_type):
-                all_punches.append(datetime.combine(d, day_punches[punch_type]))
-    all_punches.sort()
-
-    if not all_punches:
-        return {}
-
-    current_shift_start_date = None
-    
-    # 2. Processa as batidas em pares (entrada/saída)
-    for i in range(0, len(all_punches) - 1, 2):
-        start_dt = all_punches[i]
-        end_dt = all_punches[i+1]
-        
-        # 3. Identifica o início de um novo turno
-        # Se for o primeiro par de batidas, ou se houve uma pausa longa (ex: > 4 horas)
-        if i == 0:
-             current_shift_start_date = start_dt.date()
-        else:
-            previous_end_dt = all_punches[i-1]
-            if (start_dt - previous_end_dt) > timedelta(hours=4):
-                current_shift_start_date = start_dt.date()
-        
-        duration = (end_dt - start_dt).total_seconds() / 60
-        
-        # 4. Acumula a duração total na data de INÍCIO do turno
-        worked_minutes_map[current_shift_start_date] = worked_minutes_map.get(current_shift_start_date, 0) + duration
-
-    return {d: int(round(m)) for d, m in worked_minutes_map.items()}
+def _calculate_minutes_from_punches(punches: List[datetime]) -> int:
+    total_seconds = 0
+    for i in range(0, len(punches) - (len(punches) % 2), 2):
+        start_dt = punches[i]
+        end_dt = punches[i+1]
+        total_seconds += (end_dt - start_dt).total_seconds()
+    return int(round(total_seconds / 60))
 
 def calculate_daily_balance(work_date: date, worked_minutes: int, planned_minutes: int, day_type: Optional[str]) -> Dict[str, int]:
     calculated = {"normal": 0, "overtime_50": 0, "overtime_100": 0, "undertime": 0}
     is_holiday_or_dsr = work_date in br_holidays or (day_type and day_type in ['D', 'C'])
-
     if is_holiday_or_dsr:
         if worked_minutes > 0:
             calculated["overtime_100"] = worked_minutes
-        elif planned_minutes > 0:
-            calculated["undertime"] = -planned_minutes
     else:
         if planned_minutes > 0:
             balance = worked_minutes - planned_minutes
@@ -192,8 +157,7 @@ def calculate_daily_balance(work_date: date, worked_minutes: int, planned_minute
                 calculated["normal"] = worked_minutes
                 calculated["undertime"] = balance
         elif worked_minutes > 0:
-            calculated["normal"] = worked_minutes
-            
+             calculated["overtime_50"] = worked_minutes
     return {k: int(v) for k, v in calculated.items()}
 
 # --- ENDPOINTS ---
@@ -211,15 +175,201 @@ def register_user(user: UserCreate, db: Session = Depends(get_db_app)):
     if db.query(models.AppUser).filter(models.AppUser.username == user.username).first():
         raise HTTPException(status_code=400, detail="Username already registered")
     new_user = models.AppUser(username=user.username, hashed_password=get_password_hash(user.password))
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
+    db.add(new_user); db.commit(); db.refresh(new_user)
     return {"status": "success", "username": new_user.username}
 
 @app.get("/employees/main")
 def get_all_employees(db: Session = Depends(get_db_main), current_user: models.AppUser = Depends(get_current_user)):
     return {"status": "success", "employees": main_system_queries.get_all_employees_from_main_system(db)}
 
+@app.post("/get-relatorio-funcionario")
+async def get_relatorio_funcionario_endpoint(data: RelatorioRequest, db: Session = Depends(get_db_main)):
+    try:
+        matricula = data.matricula
+        data_inicio = datetime.strptime(data.data_inicio, "%Y-%m-%d").date()
+        data_fim = datetime.strptime(data.data_fim, "%Y-%m-%d").date()
+        filial = matricula[:4]
+        turno = main_system_queries.get_employee_shift_code(db, matricula)
+        if not turno:
+            raise HTTPException(status_code=404, detail="Turno do funcionário não encontrado.")
+        shift_details = main_system_queries.get_shift_info(db, turno)
+        weeks_in_cycle = shift_details.get("weeks_in_cycle", 1)
+        start_date_protheus = date(1980, 1, 6)
+        all_punches = get_raw_punches_for_period(db, matricula, data_inicio - timedelta(days=1), data_fim + timedelta(days=1))
+        dias_relatorio = []
+        data_atual = data_inicio
+        while data_atual <= data_fim:
+            days_diff = (data_atual - start_date_protheus).days
+            cycle_week = (days_diff // 7) % weeks_in_cycle + 1 if weeks_in_cycle > 0 else 1
+            day_of_week_protheus = (data_atual.isoweekday() % 7) + 1
+            escala_info = main_system_queries.get_work_schedule_info_for_day(db, turno, filial, cycle_week, day_of_week_protheus)
+            jornada_prevista_minutos = escala_info.get("minutes", 0)
+            tipo_dia = escala_info.get("type", "S")
+            batidas_do_dia = {"entry1": None, "exit1": None, "entry2": None, "exit2": None}
+            horario_previsto = ""
+            horas_trabalhadas_str = "00:00"
+            if tipo_dia not in ["F", "D"]:
+                schedule_times = get_schedule_times_for_day(db, turno, filial, cycle_week, day_of_week_protheus)
+                if schedule_times.get("start") and schedule_times.get("end"):
+                    start_time = schedule_times["start"]
+                    end_time = schedule_times["end"]
+                    horario_previsto = f"{start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}"
+                    shift_start_dt = datetime.combine(data_atual, start_time)
+                    shift_end_dt = datetime.combine(data_atual, end_time)
+                    if shift_end_dt < shift_start_dt: shift_end_dt += timedelta(days=1)
+                    search_window_start = shift_start_dt - timedelta(hours=2)
+                    search_window_end = shift_end_dt + timedelta(hours=4)
+                    punches_for_this_shift = sorted([p for p in all_punches if search_window_start <= p <= search_window_end])
+                    if punches_for_this_shift:
+                        worked_minutes = _calculate_minutes_from_punches(punches_for_this_shift)
+                        horas_trabalhadas_str = f"{worked_minutes // 60:02d}:{worked_minutes % 60:02d}"
+                        if len(punches_for_this_shift) >= 1: batidas_do_dia["entry1"] = punches_for_this_shift[0].time().strftime('%H:%M')
+                        if len(punches_for_this_shift) >= 2: batidas_do_dia["exit1"] = punches_for_this_shift[1].time().strftime('%H:%M')
+                        if len(punches_for_this_shift) >= 3: batidas_do_dia["entry2"] = punches_for_this_shift[2].time().strftime('%H:%M')
+                        if len(punches_for_this_shift) >= 4: batidas_do_dia["exit2"] = punches_for_this_shift[3].time().strftime('%H:%M')
+            dias_relatorio.append({
+                "data": data_atual.strftime("%d/%m/%Y"),
+                "dia_semana": ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"][data_atual.weekday()],
+                "horario_previsto": horario_previsto,
+                "jornada_prevista": f"{jornada_prevista_minutos // 60:02d}:{jornada_prevista_minutos % 60:02d}",
+                "batidas": batidas_do_dia,
+                "horas_trabalhadas": horas_trabalhadas_str,
+                "tipo_dia": tipo_dia
+            })
+            data_atual += timedelta(days=1)
+        return {"dias": dias_relatorio}
+    except Exception as e:
+        logger.error(f"Erro ao gerar relatório para {data.matricula}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Erro interno ao gerar relatório: {str(e)}")
+
+@app.post("/report/monthly", response_model=List[DetailedReportData])
+def generate_detailed_monthly_report(request: MonthlyReportRequest, db_app: Session = Depends(get_db_app), db_main: Session = Depends(get_db_main), current_user: models.AppUser = Depends(get_current_user)):
+    report_data = []
+    all_employees_map = {emp['employee_id']: emp['name'] for emp in main_system_queries.get_all_employees_from_main_system(db_main)}
+    start_date = date(request.year, request.month, 1)
+    _, num_days_in_month = calendar.monthrange(request.year, request.month)
+    end_date = date(request.year, request.month, num_days_in_month)
+    
+    for emp_id in request.employee_ids:
+        default_shift_code = main_system_queries.get_employee_shift_code(db_main, emp_id)
+        if not default_shift_code:
+            logger.warning(f"Pulando funcionário {emp_id}: turno padrão não encontrado.")
+            continue
+        default_shift_info = main_system_queries.get_shift_info(db_main, default_shift_code)
+        is_overnight_shift = default_shift_info.get("planned_start_time") and default_shift_info["planned_start_time"].hour >= 18
+        
+        main_system_punches_list = get_raw_punches_for_period(db_main, emp_id, start_date - timedelta(days=1), end_date + timedelta(days=1))
+        
+        app_punches_db = db_app.query(models.ExternalPunch).filter(
+            models.ExternalPunch.employee_id == emp_id,
+            models.ExternalPunch.work_date >= start_date,
+            models.ExternalPunch.work_date <= end_date
+        ).all()
+        
+        app_punches_map = {p.work_date: {"entry1": p.entry1, "exit1": p.exit1, "entry2": p.entry2, "exit2": p.exit2} for p in app_punches_db}
+
+        daily_breakdown_list = []
+        totals_in_minutes = {"normal": 0, "overtime_50": 0, "overtime_100": 0, "undertime": 0}
+
+        for day in range(1, num_days_in_month + 1):
+            current_date = date(request.year, request.month, day)
+            filial = emp_id[:4]
+            weeks_in_cycle = default_shift_info.get("weeks_in_cycle", 1)
+            day_of_week_protheus = (current_date.isoweekday() % 7) + 1
+            # Recalcula cycle_week DENTRO do loop para garantir que está correto para cada dia
+            days_diff = (current_date - request.cycle_start_date).days
+            cycle_week = (days_diff // 7) % weeks_in_cycle + 1 if weeks_in_cycle > 0 and days_diff >= 0 else 1
+
+            planned_minutes = 0
+            day_type = None # Inicia como None para garantir que seja definido
+            status = None
+            
+            manual_override = db_app.query(models.ManualOverride).filter_by(employee_id=emp_id, work_date=current_date).first()
+            if manual_override:
+                status = manual_override.override_type
+                calculated_minutes = {"normal": 0, "overtime_50": 0, "overtime_100": 0, "undertime": 0}
+                main_punches_for_day = {}
+            else:
+                # --- LÓGICA DE PRIORIDADE CORRIGIDA ---
+                # 1. Checa a planilha de escala primeiro
+                daily_schedule_app = db_app.query(models.EscalaDiaria).filter_by(employee_id=emp_id, work_date=current_date).first()
+                if daily_schedule_app:
+                    if daily_schedule_app.day_type == 'FOLGA':
+                        day_type = 'D'
+                        status = 'D'
+                    else: # É 'TRABALHO' na planilha
+                        day_type = 'S' # Força a ser um dia de trabalho
+                        shift_code = daily_schedule_app.shift_code or default_shift_code
+                        planned_minutes = main_system_queries.get_standard_shift_minutes(db_main, shift_code)
+                else: 
+                    # 2. Se não está na planilha, usa a escala padrão do Protheus
+                    schedule_info = main_system_queries.get_work_schedule_info_for_day(db_main, default_shift_code, filial, cycle_week, day_of_week_protheus)
+                    planned_minutes = schedule_info.get('minutes', 0)
+                    day_type = schedule_info.get('type', 'S')
+
+                # 3. Busca as batidas apenas se o dia for definido como de trabalho
+                main_punches_for_day = {}
+                if day_type not in ['F', 'D', 'C']:
+                    schedule_times = get_schedule_times_for_day(db_main, default_shift_code, filial, cycle_week, day_of_week_protheus)
+                    if schedule_times.get("start"):
+                        start_time = schedule_times["start"]
+                        end_time = schedule_times.get("end") or time(23, 59)
+                        shift_start_dt = datetime.combine(current_date, start_time)
+                        shift_end_dt = datetime.combine(current_date, end_time)
+                        if shift_end_dt < shift_start_dt: shift_end_dt += timedelta(days=1)
+                        
+                        search_window_start = shift_start_dt - timedelta(hours=2)
+                        search_window_end = shift_end_dt + timedelta(hours=4)
+                        
+                        punches_for_this_shift = sorted([p for p in main_system_punches_list if search_window_start <= p <= search_window_end])
+                        
+                        if punches_for_this_shift:
+                            if len(punches_for_this_shift) >= 1: main_punches_for_day["entry1"] = punches_for_this_shift[0].time()
+                            if len(punches_for_this_shift) >= 2: main_punches_for_day["exit1"]  = punches_for_this_shift[1].time()
+                            if len(punches_for_this_shift) >= 3: main_punches_for_day["entry2"] = punches_for_this_shift[2].time()
+                            if len(punches_for_this_shift) >= 4: main_punches_for_day["exit2"]  = punches_for_this_shift[3].time()
+
+                app_punches_for_day = app_punches_map.get(current_date, {})
+                combined_punches_map = _combine_punches(main_punches_for_day, app_punches_for_day)
+                
+                temp_punches = []
+                if combined_punches_map.get("entry1"): temp_punches.append(datetime.combine(current_date, combined_punches_map["entry1"]))
+                if combined_punches_map.get("exit1"):
+                    exit_dt = datetime.combine(current_date, combined_punches_map["exit1"])
+                    if temp_punches and exit_dt < temp_punches[-1]: exit_dt += timedelta(days=1)
+                    temp_punches.append(exit_dt)
+                if combined_punches_map.get("entry2"):
+                    entry_dt = datetime.combine(current_date, combined_punches_map["entry2"])
+                    if temp_punches and entry_dt < temp_punches[-1]: entry_dt += timedelta(days=1)
+                    temp_punches.append(entry_dt)
+                if combined_punches_map.get("exit2"):
+                    exit_dt = datetime.combine(current_date, combined_punches_map["exit2"])
+                    if temp_punches and exit_dt < temp_punches[-1]: exit_dt += timedelta(days=1)
+                    temp_punches.append(exit_dt)
+                
+                worked_minutes = _calculate_minutes_from_punches(temp_punches)
+                calculated_minutes = calculate_daily_balance(current_date, worked_minutes, planned_minutes, day_type)
+            
+            daily_breakdown_list.append(DailyBreakdown(
+                date=current_date,
+                main_system_punches=main_punches_for_day,
+                app_punches=app_punches_map.get(current_date, {}),
+                calculated_minutes=calculated_minutes,
+                status=status
+            ))
+            for key in totals_in_minutes: totals_in_minutes[key] += calculated_minutes.get(key, 0)
+
+        report_data.append(DetailedReportData(
+            employee_id=emp_id,
+            employee_name=all_employees_map.get(emp_id, "Nome não encontrado"),
+            shift_description=f"{default_shift_info['description']} ({'Noturno' if is_overnight_shift else 'Diurno'})",
+            daily_breakdown=daily_breakdown_list,
+            totals_in_minutes=totals_in_minutes
+        ))
+    return report_data
+
+
+# --- OUTROS ENDPOINTS (O RESTO DO SEU CÓDIGO) ---
 @app.post("/punches/external", status_code=201)
 def receive_external_punches(request: ExternalPunchRequest, db: Session = Depends(get_db_app), current_user: models.AppUser = Depends(get_current_user)):
     existing_punch = db.query(models.ExternalPunch).filter_by(employee_id=request.employee_id, work_date=request.work_date).first()
@@ -272,7 +422,7 @@ def delete_override_range(request: ManualOverrideRequest, db: Session = Depends(
         db.delete(override)
     db.commit()
     return {"status": "success", "message": f"{count} ajuste(s) manual(is) foram removidos com sucesso."}
-    
+
 @app.post("/schedules/upload")
 async def upload_schedule_file(db: Session = Depends(get_db_app), file: UploadFile = File(...), current_user: models.AppUser = Depends(get_current_user)):
     if not file.filename.endswith(('.csv', '.xlsx')):
@@ -286,16 +436,13 @@ async def upload_schedule_file(db: Session = Depends(get_db_app), file: UploadFi
         required_columns = ['employee_id', 'work_date', 'day_type', 'shift_code']
         if not all(col in df.columns for col in required_columns):
             raise HTTPException(status_code=400, detail=f"O arquivo deve conter as colunas: {required_columns}")
-            
+
         success_count, error_count = 0, 0
         for _, row in df.iterrows():
             try:
                 employee_id = str(row['employee_id']).strip().zfill(10)
                 work_date = pd.to_datetime(row['work_date']).date()
                 day_type = str(row['day_type']).upper()
-
-                # --- CORREÇÃO FINAL AQUI ---
-                # Garante que o shift_code tenha 3 dígitos (ex: '2' vira '002')
                 shift_code = str(row['shift_code']).strip().split('.')[0].zfill(3) if pd.notna(row['shift_code']) else None
 
                 if day_type not in ['TRABALHO', 'FOLGA']:
@@ -319,151 +466,3 @@ async def upload_schedule_file(db: Session = Depends(get_db_app), file: UploadFi
         logger.error(f"Falha ao processar o arquivo de escala: {e}")
         raise HTTPException(status_code=500, detail=f"Não foi possível processar o arquivo. Erro: {e}")
 
-@app.post("/report/monthly", response_model=List[DetailedReportData])
-def generate_detailed_monthly_report(request: MonthlyReportRequest, db_app: Session = Depends(get_db_app), db_main: Session = Depends(get_db_main), current_user: models.AppUser = Depends(get_current_user)):
-    report_data = []
-    all_employees_map = {emp['employee_id']: emp['name'] for emp in main_system_queries.get_all_employees_from_main_system(db_main)}
-    start_date = date(request.year, request.month, 1)
-    _, num_days_in_month = calendar.monthrange(request.year, request.month)
-    end_date = date(request.year, request.month, num_days_in_month)
-    
-    for emp_id in request.employee_ids:
-        default_shift_code = main_system_queries.get_employee_shift_code(db_main, emp_id)
-        if not default_shift_code:
-            logger.warning(f"Pulando funcionário {emp_id}: turno padrão não encontrado.")
-            continue
-        default_shift_info = main_system_queries.get_shift_info(db_main, default_shift_code)
-        
-        main_punches_map = {}
-        app_punches_map = {}
-        
-        end_fetch_date = end_date + timedelta(days=1)
-        current_date_fetch = start_date
-        while current_date_fetch <= end_fetch_date:
-            main_punches_map[current_date_fetch] = main_system_queries.get_main_system_punches_for_day(db_main, emp_id, current_date_fetch)
-            app_punches_db = db_app.query(models.ExternalPunch).filter_by(employee_id=emp_id, work_date=current_date_fetch).first()
-            app_punches_map[current_date_fetch] = {
-                "entry1": app_punches_db.entry1 if app_punches_db else None, "exit1": app_punches_db.exit1 if app_punches_db else None, 
-                "entry2": app_punches_db.entry2 if app_punches_db else None, "exit2": app_punches_db.exit2 if app_punches_db else None
-            }
-            current_date_fetch += timedelta(days=1)
-
-        planned_start_time = default_shift_info.get("planned_start_time")
-        is_overnight_shift = planned_start_time and planned_start_time.hour >= 18
-        
-        worked_minutes_per_day = {}
-        display_main_punches = main_punches_map.copy()
-        display_app_punches = app_punches_map.copy()
-
-        if is_overnight_shift:
-            logger.info(f"Funcionário {emp_id} detectado com turno NOTURNO. Usando lógica de cálculo e exibição avançada.")
-            
-            combined_punches_map = {d: _combine_punches(main_punches_map.get(d, {}), app_punches_map.get(d, {})) for d in main_punches_map}
-            worked_minutes_per_day = _calculate_minutes_overnight_by_day(combined_punches_map)
-
-            all_punches = []
-            for d in sorted(main_punches_map.keys()):
-                punches_of_the_day = []
-                for punch_type, punch_time in main_punches_map[d].items():
-                    if punch_time: punches_of_the_day.append({'source': 'main', 'datetime': datetime.combine(d, punch_time)})
-                for punch_type, punch_time in app_punches_map[d].items():
-                    if punch_time: punches_of_the_day.append({'source': 'app', 'datetime': datetime.combine(d, punch_time)})
-                punches_of_the_day.sort(key=lambda x: x['datetime'])
-                all_punches.extend(punches_of_the_day)
-            
-            for d in display_main_punches:
-                display_main_punches[d] = {}
-                display_app_punches[d] = {}
-            
-            if all_punches:
-                shifts = []
-                current_shift = [all_punches[0]]
-                for i in range(1, len(all_punches)):
-                    punch = all_punches[i]
-                    previous_punch = all_punches[i-1]
-                    # --- AJUSTE FINAL AQUI ---
-                    # Aumentamos o tempo da pausa para 6 horas para não quebrar o turno no meio.
-                    if (punch['datetime'] - previous_punch['datetime']) > timedelta(hours=6):
-                        shifts.append(current_shift)
-                        current_shift = []
-                    current_shift.append(punch)
-                shifts.append(current_shift)
-
-                for shift in shifts:
-                    if not shift: continue
-                    start_date = shift[0]['datetime'].date()
-                    entry_count = 0
-                    exit_count = 0
-                    for i in range(len(shift)):
-                        punch = shift[i]
-                        is_entry = (i % 2 == 0)
-
-                        if is_entry:
-                            entry_count += 1
-                            display_punch_type = f"entry{entry_count}"
-                        else:
-                            exit_count += 1
-                            display_punch_type = f"exit{exit_count}"
-                        
-                        target_map = display_main_punches if punch['source'] == 'main' else display_app_punches
-                        target_map.setdefault(start_date, {})[display_punch_type] = punch['datetime'].time()
-        else:
-            logger.info(f"Funcionário {emp_id} detectado com turno DIURNO. Usando lógica de cálculo padrão.")
-            for current_date in main_punches_map:
-                if start_date <= current_date <= end_date:
-                    combined = _combine_punches(main_punches_map.get(current_date, {}), app_punches_map.get(current_date, {}))
-                    worked_minutes_per_day[current_date] = _calculate_minutes_standard(combined)
-        
-        # O restante da função continua exatamente igual...
-        daily_breakdown_list = []
-        totals_in_minutes = {"normal": 0, "overtime_50": 0, "overtime_100": 0, "undertime": 0}
-
-        for day in range(1, num_days_in_month + 1):
-            current_date = date(request.year, request.month, day)
-            
-            planned_minutes = 0; day_type = None; status = None
-            
-            manual_override = db_app.query(models.ManualOverride).filter_by(employee_id=emp_id, work_date=current_date).first()
-            if manual_override:
-                status = manual_override.override_type
-                calculated_minutes = {"normal": 0, "overtime_50": 0, "overtime_100": 0, "undertime": 0}
-            else:
-                daily_schedule = db_app.query(models.EscalaDiaria).filter_by(employee_id=emp_id, work_date=current_date).first()
-                if daily_schedule:
-                    if daily_schedule.day_type == 'FOLGA':
-                        status = 'D'; planned_minutes = 0; day_type = 'D'
-                    else:
-                        shift_code_for_the_day = daily_schedule.shift_code or default_shift_code
-                        planned_minutes = main_system_queries.get_standard_shift_minutes(db_main, shift_code_for_the_day)
-                        day_type = 'S'
-                else:
-                    filial = emp_id[:4]
-                    day_of_week = (current_date.isoweekday() % 7) + 1
-                    cycle_week = get_cycle_week(current_date, request.cycle_start_date, default_shift_info["weeks_in_cycle"])
-                    schedule_info = main_system_queries.get_work_schedule_info_for_day(db_main, default_shift_code, filial, cycle_week, day_of_week)
-                    planned_minutes = schedule_info.get('minutes', 0)
-                    day_type = schedule_info.get('type')
-                
-                worked_minutes = worked_minutes_per_day.get(current_date, 0)
-                calculated_minutes = calculate_daily_balance(current_date, worked_minutes, planned_minutes, day_type)
-                if status is None and (current_date in br_holidays or (day_type and day_type in ['D', 'C'])):
-                    status = day_type
-            
-            daily_breakdown_list.append(DailyBreakdown(
-                date=current_date, 
-                main_system_punches=display_main_punches.get(current_date, {}),
-                app_punches=display_app_punches.get(current_date, {}),
-                calculated_minutes=calculated_minutes, 
-                status=status
-            ))
-            for key in totals_in_minutes:
-                totals_in_minutes[key] += calculated_minutes.get(key, 0)
-            
-        report_data.append(DetailedReportData(
-            employee_id=emp_id,
-            employee_name=all_employees_map.get(emp_id, "Nome não encontrado"),
-            shift_description=f"{default_shift_info['description']} ({'Noturno' if is_overnight_shift else 'Diurno'})",
-            daily_breakdown=daily_breakdown_list,
-            totals_in_minutes=totals_in_minutes
-        ))
-    return report_data

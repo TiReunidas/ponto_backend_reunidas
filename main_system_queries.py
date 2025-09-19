@@ -1,7 +1,7 @@
 import logging
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 from typing import Dict, Optional, List, Any
 
 logger = logging.getLogger(__name__)
@@ -17,7 +17,7 @@ def get_all_employees_from_main_system(db: Session) -> List[Dict[str, str]]:
         FROM
             SRA010 AS sra
         LEFT JOIN
-            SR6010 AS sr6 ON sra.RA_TNOTRAB = sr6.R6_TURNO 
+            SR6010 AS sr6 ON sra.RA_TNOTRAB = sr6.R6_TURNO
             AND (sr6.R6_FILIAL = sra.RA_FILIAL OR sr6.R6_FILIAL = '')
             AND sr6.D_E_L_E_T_ <> '*'
         WHERE
@@ -45,11 +45,11 @@ def get_all_employees_from_main_system(db: Session) -> List[Dict[str, str]]:
 
 def get_shift_info(db: Session, shift_code: str) -> Dict:
     shift_info = {
-        "description": f"Turno {shift_code}", 
+        "description": f"Turno {shift_code}",
         "weeks_in_cycle": 1,
         "planned_start_time": None
     }
-    
+
     desc_query = text("SELECT TOP 1 TRIM(R6_DESC) FROM SR6010 WHERE R6_TURNO = :shift_code AND D_E_L_E_T_ <> '*'")
     description = db.execute(desc_query, {"shift_code": shift_code}).scalar_one_or_none()
     if description:
@@ -79,8 +79,8 @@ def get_work_schedule_info_for_day(db: Session, shift_code: str, filial: str, cy
     logger.info(f"VERIFICANDO BANCO: PJ_TURNO='{shift_code}', PJ_FILIAL='{filial_curta}', PJ_SEMANA='{semana_formatada}', PJ_DIA='{dia_formatado}'")
     default_result = {"minutes": 0, "type": "F"}
     sql_query = text("""
-        SELECT TOP 1 
-            (ISNULL(PJ_HRSTRAB, 0) + ISNULL(PJ_HRSTRA2, 0)) AS horas_trabalhadas, 
+        SELECT TOP 1
+            (ISNULL(PJ_HRSTRAB, 0) + ISNULL(PJ_HRSTRA2, 0)) AS horas_trabalhadas,
             PJ_TPDIA
         FROM SPJ010
         WHERE TRIM(PJ_TURNO) = :shift_code
@@ -107,73 +107,6 @@ def get_work_schedule_info_for_day(db: Session, shift_code: str, filial: str, cy
         logger.error(f"Erro ao buscar jornada de trabalho para o turno {shift_code}: {e}")
         return default_result
 
-def get_main_system_punches_for_day(db: Session, employee_id: str, work_date: date) -> Dict[str, Optional[time]]:
-    logger.info(f"Buscando batidas do sistema principal para Matrícula: {employee_id}, Data: {work_date}")
-    filial_completa = employee_id[:4]
-    matricula = employee_id[4:]
-    data_str = work_date.strftime('%Y%m%d')
-
-    def convert_to_time(hour_float: Optional[float]) -> Optional[time]:
-        if hour_float is None: return None
-        hour = int(hour_float)
-        minute = int(round((hour_float - hour) * 100))
-        if not 0 <= minute <= 59:
-            logger.warning(f"Minuto inválido ({minute}) ao converter hora {hour_float}. Retornando None.")
-            return None
-        return time(hour, minute)
-
-    # 1. Tenta buscar na tabela de movimentações (SP8010)
-    sql_query_sp8 = text("""
-        SELECT
-            MAX(CASE WHEN TRIM(P8_TPMARCA) = '1E' THEN P8_HORA ELSE NULL END) AS hora_1e,
-            MAX(CASE WHEN TRIM(P8_TPMARCA) = '1S' THEN P8_HORA ELSE NULL END) AS hora_1s,
-            MAX(CASE WHEN TRIM(P8_TPMARCA) = '2E' THEN P8_HORA ELSE NULL END) AS hora_2e,
-            MAX(CASE WHEN TRIM(P8_TPMARCA) = '2S' THEN P8_HORA ELSE NULL END) AS hora_2s
-        FROM SP8010
-        WHERE TRIM(P8_FILIAL) = :filial AND TRIM(P8_MAT) = :matricula AND TRIM(P8_DATA) = :data
-          AND TRIM(P8_APONTA) = 'S' AND (D_E_L_E_T_ IS NULL OR D_E_L_E_T_ <> '*')
-    """)
-    try:
-        result_sp8 = db.execute(sql_query_sp8, {"filial": filial_completa, "matricula": matricula, "data": data_str}).fetchone()
-        if result_sp8 and any(result_sp8):
-            punches = {
-                "entry1": convert_to_time(result_sp8.hora_1e), "exit1": convert_to_time(result_sp8.hora_1s),
-                "entry2": convert_to_time(result_sp8.hora_2e), "exit2": convert_to_time(result_sp8.hora_2s)
-            }
-            logger.info(f"SUCESSO! Batidas encontradas em SP8010 para {employee_id} em {work_date}: {punches}")
-            return punches
-    except Exception as e:
-        logger.error(f"Erro ao consultar SP8010 para batidas de ponto: {e}")
-
-    logger.warning(f"Nenhuma batida encontrada em SP8010 para {employee_id}. Verificando histórico (SPG010)...")
-
-    # 2. Se não encontrou, busca na tabela de histórico (SPG010)
-    sql_query_spg = text("""
-        SELECT
-            MAX(CASE WHEN TRIM(PG_TPMARCA) = '1E' THEN PG_HORA ELSE NULL END) AS hora_1e,
-            MAX(CASE WHEN TRIM(PG_TPMARCA) = '1S' THEN PG_HORA ELSE NULL END) AS hora_1s,
-            MAX(CASE WHEN TRIM(PG_TPMARCA) = '2E' THEN PG_HORA ELSE NULL END) AS hora_2e,
-            MAX(CASE WHEN TRIM(PG_TPMARCA) = '2S' THEN PG_HORA ELSE NULL END) AS hora_2s
-        FROM SPG010
-        WHERE TRIM(PG_FILIAL) = :filial AND TRIM(PG_MAT) = :matricula AND TRIM(PG_DATA) = :data
-          AND TRIM(PG_APONTA) = 'S' AND (D_E_L_E_T_ IS NULL OR D_E_L_E_T_ <> '*')
-    """)
-    try:
-        result_spg = db.execute(sql_query_spg, {"filial": filial_completa, "matricula": matricula, "data": data_str}).fetchone()
-        if result_spg and any(result_spg):
-            punches = {
-                "entry1": convert_to_time(result_spg.hora_1e), "exit1": convert_to_time(result_spg.hora_1s),
-                "entry2": convert_to_time(result_spg.hora_2e), "exit2": convert_to_time(result_spg.hora_2s)
-            }
-            logger.info(f"SUCESSO! Batidas encontradas no histórico SPG010 para {employee_id} em {work_date}: {punches}")
-            return punches
-    except Exception as e:
-        logger.error(f"Erro ao consultar o histórico SPG010 para batidas de ponto: {e}")
-        raise e
-
-    logger.warning(f"Nenhuma batida de ponto encontrada para {employee_id} na data {work_date} (nem em SP8, nem em SPG)")
-    return {"entry1": None, "exit1": None, "entry2": None, "exit2": None}
-
 def get_employee_shift_code(db: Session, employee_id: str) -> Optional[str]:
     logger.info(f"Buscando código do turno para o funcionário: {employee_id}")
     filial = employee_id[:4]
@@ -195,10 +128,6 @@ def get_employee_shift_code(db: Session, employee_id: str) -> Optional[str]:
         return None
 
 def get_standard_shift_minutes(db: Session, shift_code: str) -> int:
-    """
-    Busca a jornada de trabalho padrão em minutos para um determinado turno,
-    pegando o valor de horas mais comum (moda) diferente de zero.
-    """
     logger.info(f"Buscando jornada padrão para o turno: {shift_code}")
     sql_query = text("""
         SELECT TOP 1
@@ -225,3 +154,96 @@ def get_standard_shift_minutes(db: Session, shift_code: str) -> int:
     except Exception as e:
         logger.error(f"Erro ao buscar jornada padrão para o turno {shift_code}: {e}")
         return 0
+
+# --- FUNÇÕES CORRIGIDAS ---
+
+def _convert_float_to_time(hour_float: Optional[float]) -> Optional[time]:
+    """Converte um horário em formato float (ex: 22.40) para um objeto time."""
+    if hour_float is None or hour_float == 0:
+        return None
+    try:
+        hour = int(hour_float)
+        minute = int(round((hour_float - hour) * 100))
+        return time(hour, minute) if 0 <= hour <= 23 and 0 <= minute <= 59 else None
+    except (ValueError, TypeError):
+        return None
+
+def get_schedule_times_for_day(db: Session, shift_code: str, filial: str, cycle_week: int, day_of_week: int) -> Dict[str, Optional[time]]:
+    """Busca os horários de início e fim da escala para um dia específico."""
+    filial_curta = filial[:2]
+    semana_formatada = str(cycle_week).zfill(2)
+    dia_formatado = str(day_of_week)
+
+    # --- CORREÇÃO APLICADA AQUI ---
+    sql_query = text("""
+        SELECT TOP 1
+            PJ_ENTRA1, PJ_SAIDA1, PJ_ENTRA2, PJ_SAIDA2
+        FROM SPJ010
+        WHERE TRIM(PJ_TURNO) = :shift_code
+          AND (TRIM(PJ_FILIAL) = :filial OR TRIM(PJ_FILIAL) = '')
+          AND TRIM(PJ_SEMANA) = :cycle_week
+          AND TRIM(PJ_DIA) = :day_of_week
+          AND D_E_L_E_T_ <> '*'
+        ORDER BY PJ_FILIAL DESC;
+    """)
+    try:
+        result = db.execute(sql_query, {
+            "shift_code": shift_code, "filial": filial_curta,
+            "cycle_week": semana_formatada, "day_of_week": dia_formatado
+        }).fetchone()
+        if result:
+            start_time = _convert_float_to_time(result.PJ_ENTRA1)
+            # A saída final do turno é a última batida registrada (SAIDA2 ou, se não houver, SAIDA1)
+            end_time = _convert_float_to_time(result.PJ_SAIDA2) or _convert_float_to_time(result.PJ_SAIDA1)
+            return {"start": start_time, "end": end_time}
+    except Exception as e:
+        logger.error(f"Erro ao buscar horários da escala para o turno {shift_code}: {e}")
+
+    return {"start": None, "end": None}
+
+def get_raw_punches_for_period(db: Session, employee_id: str, start_date: date, end_date: date) -> List[datetime]:
+    """Busca todas as batidas de um funcionário em um período, retornando uma lista de datetimes."""
+    logger.info(f"Buscando todas as batidas brutas para {employee_id} de {start_date} a {end_date}")
+    filial_completa = employee_id[:4]
+    matricula = employee_id[4:]
+    start_str = start_date.strftime('%Y%m%d')
+    end_str = end_date.strftime('%Y%m%d')
+
+    all_punches = []
+
+    def fetch_from_table(table_name: str, date_col: str, hour_col: str, mat_col: str, filial_col: str):
+        sql = text(f"""
+            SELECT {date_col} AS data, {hour_col} AS hora
+            FROM {table_name}
+            WHERE TRIM({filial_col}) = :filial
+              AND TRIM({mat_col}) = :matricula
+              AND {date_col} BETWEEN :start_date AND :end_date
+              AND (D_E_L_E_T_ IS NULL OR D_E_L_E_T_ <> '*')
+        """)
+        try:
+            results = db.execute(sql, {
+                "filial": filial_completa, "matricula": matricula,
+                "start_date": start_str, "end_date": end_str
+            }).fetchall()
+
+            for row in results:
+                punch_time = _convert_float_to_time(row.hora)
+                if punch_time:
+                    try:
+                        punch_date = datetime.strptime(row.data.strip(), '%Y%m%d').date()
+                        all_punches.append(datetime.combine(punch_date, punch_time))
+                    except (ValueError, AttributeError):
+                        continue # Ignora datas mal formatadas
+        except Exception as e:
+            logger.error(f"Erro ao buscar batidas da tabela {table_name}: {e}")
+
+    # Busca nas duas tabelas
+    fetch_from_table('SP8010', 'P8_DATA', 'P8_HORA', 'P8_MAT', 'P8_FILIAL')
+    fetch_from_table('SPG010', 'PG_DATA', 'PG_HORA', 'PG_MAT', 'PG_FILIAL')
+
+    # Remove duplicatas e ordena
+    unique_punches = sorted(list(set(all_punches)))
+    logger.info(f"Encontradas {len(unique_punches)} batidas brutas para {employee_id}.")
+    return unique_punches
+
+    
